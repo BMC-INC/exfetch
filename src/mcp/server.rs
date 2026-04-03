@@ -154,8 +154,17 @@ async fn sse_handler(
         });
 
     // Keep-alive every 15 seconds to prevent proxy/CDN buffering
-    Sse::new(endpoint_event.chain(response_stream))
-        .keep_alive(axum::response::sse::KeepAlive::new().interval(std::time::Duration::from_secs(15)))
+    let sse = Sse::new(endpoint_event.chain(response_stream))
+        .keep_alive(axum::response::sse::KeepAlive::new().interval(std::time::Duration::from_secs(15)));
+
+    // Add headers to prevent buffering by reverse proxies (Cloudflare, nginx, etc.)
+    (
+        [
+            (axum::http::header::CACHE_CONTROL, "no-cache, no-transform"),
+            (axum::http::HeaderName::from_static("x-accel-buffering"), "no"),
+        ],
+        sse,
+    )
 }
 
 /// POST /message endpoint: receives JSON-RPC requests and dispatches them.
