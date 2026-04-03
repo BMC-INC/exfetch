@@ -1,0 +1,23 @@
+[package]
+name = "exfetch"
+version = "0.1.0"
+edition = "2021"
+description = "Browser-aware web execution layer for LLM agents"
+license = "MIT"
+repository = "https://github.com/BMC-INC/exfetch"
+
+[lib]
+name = "exfetch"
+path = "src/lib.rs"
+
+[[bin]]
+name = "exfetch"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }
+anyhow = "1"
+
+[features]
+default = []
