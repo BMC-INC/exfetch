@@ -145,6 +145,91 @@ pub async fn fetch_url(
     })
 }
 
+/// Response returned when fetching raw bytes (e.g. for PDFs).
+#[derive(Debug, Clone)]
+pub struct BytesResponse {
+    pub bytes: Vec<u8>,
+    pub status: u16,
+    pub content_type: String,
+    pub final_url: String,
+    pub headers: Vec<(String, String)>,
+    pub fetch_time_ms: u64,
+}
+
+/// Fetch a URL and return the response body as raw bytes.
+///
+/// Unlike [`fetch_url`], this does not reject binary content types and
+/// reads the body as bytes rather than text. Useful for PDF and other
+/// binary content that needs further processing.
+pub async fn fetch_bytes(
+    raw_url: &str,
+    timeout: Duration,
+    user_agent: &str,
+) -> Result<BytesResponse, FetchError> {
+    let url = normalize_url(raw_url)?;
+
+    let client = reqwest::Client::builder()
+        .timeout(timeout)
+        .redirect(Policy::limited(10))
+        .user_agent(user_agent)
+        .build()
+        .map_err(|e| FetchError::Network(e.to_string()))?;
+
+    let start = Instant::now();
+
+    let response = client.get(url.as_str()).send().await.map_err(|e| {
+        if e.is_timeout() {
+            FetchError::Timeout {
+                timeout_secs: timeout.as_secs(),
+            }
+        } else if e.is_redirect() {
+            FetchError::TooManyRedirects
+        } else {
+            FetchError::Network(e.to_string())
+        }
+    })?;
+
+    let status = response.status().as_u16();
+    let final_url = response.url().to_string();
+
+    let headers: Vec<(String, String)> = response
+        .headers()
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
+        .collect();
+
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+
+    if status >= 400 {
+        return Err(FetchError::HttpError {
+            status,
+            url: final_url,
+        });
+    }
+
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|e| FetchError::Network(e.to_string()))?
+        .to_vec();
+
+    let fetch_time_ms = start.elapsed().as_millis() as u64;
+
+    Ok(BytesResponse {
+        bytes,
+        status,
+        content_type,
+        final_url,
+        headers,
+        fetch_time_ms,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1,6 +1,7 @@
 use std::time::Duration;
 
 use exfetch::fetch::http::{fetch_url, FetchError};
+use exfetch::fetch::pdf::{extract_text, PdfError};
 
 #[tokio::test]
 async fn test_fetch_success_returns_body() {
@@ -48,5 +49,79 @@ async fn test_fetch_timeout() {
     match result.unwrap_err() {
         FetchError::Timeout { .. } => {} // expected
         other => panic!("expected Timeout, got: {:?}", other),
+    }
+}
+
+// ─── PDF extraction tests ───────────────────────────────────────────
+
+#[test]
+fn test_pdf_extraction() {
+    use lopdf::dictionary;
+    use lopdf::{Document, Object, Stream};
+
+    let mut doc = Document::with_version("1.4");
+
+    let font_id = doc.add_object(dictionary! {
+        "Type" => "Font",
+        "Subtype" => "Type1",
+        "BaseFont" => "Helvetica",
+    });
+
+    let content = b"BT /F1 12 Tf 100 700 Td (Hello from exfetch PDF test) Tj ET";
+    let content_stream = Stream::new(dictionary! {}, content.to_vec());
+    let content_id = doc.add_object(content_stream);
+
+    let resources = dictionary! {
+        "Font" => dictionary! {
+            "F1" => font_id,
+        },
+    };
+
+    let page_id = doc.add_object(dictionary! {
+        "Type" => "Page",
+        "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+        "Contents" => content_id,
+        "Resources" => resources,
+    });
+
+    let pages_id = doc.add_object(dictionary! {
+        "Type" => "Pages",
+        "Kids" => vec![page_id.into()],
+        "Count" => 1,
+    });
+
+    if let Ok(page) = doc.get_object_mut(page_id) {
+        if let Object::Dictionary(ref mut dict) = page {
+            dict.set("Parent", pages_id);
+        }
+    }
+
+    let catalog_id = doc.add_object(dictionary! {
+        "Type" => "Catalog",
+        "Pages" => pages_id,
+    });
+
+    doc.trailer.set("Root", catalog_id);
+
+    let mut buf = Vec::new();
+    doc.save_to(&mut buf).expect("failed to save test PDF");
+
+    let text = extract_text(&buf).expect("should extract text from valid PDF");
+    assert!(!text.is_empty(), "extracted text should not be empty");
+    assert!(
+        text.contains("Hello from exfetch PDF test"),
+        "expected test text in extracted content, got: {:?}",
+        text
+    );
+}
+
+#[test]
+fn test_pdf_invalid_bytes() {
+    let garbage = b"not a valid pdf file at all";
+    let result = extract_text(garbage);
+    assert!(result.is_err(), "garbage bytes should produce an error");
+    match result.unwrap_err() {
+        PdfError::ParseError(_) => {} // expected
+        other => panic!("expected ParseError, got: {:?}", other),
     }
 }
