@@ -103,6 +103,7 @@ pub async fn run_sse(
     };
 
     let app = Router::new()
+        .route("/", get(sse_handler.clone()))
         .route("/sse", get(sse_handler))
         .route("/message", post(message_handler))
         .with_state(state);
