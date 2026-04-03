@@ -6,6 +6,7 @@ use exfetch::cli::commands::{Cli, Commands};
 use exfetch::fetch::http::{fetch_bytes, fetch_url};
 use exfetch::fetch::pdf;
 use exfetch::output;
+use exfetch::search;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -110,11 +111,55 @@ async fn main() -> Result<()> {
             }
         }
         Commands::Search(args) => {
-            println!(
-                "search: query=\"{}\" engine={} results={}",
-                args.query, args.engine, args.results
-            );
-            println!("  [placeholder] search not yet implemented");
+            let timeout = Duration::from_secs(args.timeout);
+            let num_results = args.results as usize;
+
+            if args.fetch {
+                // Search + fetch top results
+                let fetch_count = std::cmp::min(3, num_results);
+                match search::search_and_fetch(&args.query, num_results, fetch_count, timeout)
+                    .await
+                {
+                    Ok(results) => {
+                        if results.is_empty() {
+                            if !args.quiet {
+                                eprintln!("[exfetch] no results found for \"{}\"", args.query);
+                            }
+                        } else if args.json {
+                            let json = serde_json::to_string_pretty(&results)
+                                .unwrap_or_else(|e| format!("{{\"error\": \"{}\"}}", e));
+                            println!("{}", json);
+                        } else {
+                            println!("{}", search::format_fetched_results_text(&results));
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("error: {}", e);
+                        std::process::exit(1);
+                    }
+                }
+            } else {
+                // Search only (no fetch)
+                match search::engine::search_ddg(&args.query, num_results, timeout).await {
+                    Ok(results) => {
+                        if results.is_empty() {
+                            if !args.quiet {
+                                eprintln!("[exfetch] no results found for \"{}\"", args.query);
+                            }
+                        } else if args.json {
+                            let json = serde_json::to_string_pretty(&results)
+                                .unwrap_or_else(|e| format!("{{\"error\": \"{}\"}}", e));
+                            println!("{}", json);
+                        } else {
+                            println!("{}", search::format_results_text(&results));
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("error: {}", e);
+                        std::process::exit(1);
+                    }
+                }
+            }
         }
         Commands::Serve(args) => {
             println!("serve: port={}", args.port);
