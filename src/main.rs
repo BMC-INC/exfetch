@@ -4,6 +4,7 @@ use anyhow::Result;
 use clap::Parser;
 use exfetch::cli::commands::{Cli, Commands};
 use exfetch::fetch::http::fetch_url;
+use exfetch::output;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -21,7 +22,18 @@ async fn main() -> Result<()> {
                         );
                         eprintln!("[exfetch] content-type: {}", resp.content_type);
                     }
-                    println!("{}", resp.body);
+
+                    let out = if args.raw {
+                        resp.body.clone()
+                    } else if args.json {
+                        output::json::format(&resp, args.max_length)
+                    } else if args.markdown {
+                        output::markdown::format(&resp.body, args.max_length)
+                    } else {
+                        output::text::format(&resp.body, args.max_length)
+                    };
+
+                    println!("{}", out);
                 }
                 Err(e) => {
                     eprintln!("error: {}", e);

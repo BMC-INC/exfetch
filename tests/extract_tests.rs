@@ -1,4 +1,5 @@
-use exfetch::extract::{metadata, readability};
+use exfetch::extract::{markdown, metadata, readability};
+use exfetch::output::text;
 use std::fs;
 
 fn load_fixture(name: &str) -> String {
@@ -77,4 +78,73 @@ fn test_extract_empty_html_returns_fallback() {
 
     let meta2 = metadata::extract("");
     assert!(meta2.title.is_none());
+}
+
+#[test]
+fn test_truncation_at_word_boundary() {
+    let input = "The quick brown fox jumps over the lazy dog";
+    // Limit to 18 chars — should cut at a word boundary before or at 18
+    let out = text::format_raw(input, Some(18));
+    assert!(
+        out.contains("[truncated at"),
+        "should show truncation marker, got: {}",
+        out
+    );
+    // The truncated portion should not end mid-word
+    let first_line = out.lines().next().unwrap();
+    assert!(
+        first_line.ends_with(' ') || first_line == "The quick brown" || !first_line.contains("fo"),
+        "should truncate at a word boundary, got: {}",
+        first_line
+    );
+    assert!(
+        out.contains(&format!("full content {} chars", input.len())),
+        "should report full content length, got: {}",
+        out
+    );
+}
+
+#[test]
+fn test_markdown_preserves_headers_and_links() {
+    let html = load_fixture("article_with_formatting.html");
+    let md = markdown::to_markdown(&html);
+
+    // Headers should survive
+    assert!(
+        md.contains("Guide to Rust"),
+        "should preserve h1 heading, got: {}",
+        md
+    );
+    assert!(
+        md.contains("Code Example"),
+        "should preserve h2 heading, got: {}",
+        md
+    );
+    assert!(
+        md.contains("Resources"),
+        "should preserve h2 heading, got: {}",
+        md
+    );
+
+    // Links should survive (text and URL)
+    assert!(
+        md.contains("Official docs"),
+        "should preserve link text, got: {}",
+        md
+    );
+    assert!(
+        md.contains("https://doc.rust-lang.org"),
+        "should preserve link URL, got: {}",
+        md
+    );
+    assert!(
+        md.contains("Crate registry"),
+        "should preserve link text, got: {}",
+        md
+    );
+    assert!(
+        md.contains("https://crates.io"),
+        "should preserve link URL, got: {}",
+        md
+    );
 }
