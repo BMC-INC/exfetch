@@ -4,5 +4,6 @@ pub mod config;
 pub mod engine;
 pub mod extract;
 pub mod fetch;
+pub mod mcp;
 pub mod output;
 pub mod search;

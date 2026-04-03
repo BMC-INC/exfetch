@@ -35,9 +35,13 @@ uuid = { version = "1", features = ["v4"] }
 rand = "0.8"
 hex = "0.4"
 chrono = { version = "0.4", features = ["serde"] }
+axum = "0.8"
+tower = "0.5"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+tokio-stream = { version = "0.1", features = ["sync"] }
 
 [dev-dependencies]
-futures-util = "0.3"
 
 [features]
 default = []

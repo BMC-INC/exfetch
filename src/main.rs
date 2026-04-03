@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -5,13 +6,17 @@ use clap::Parser;
 use exfetch::bridge::connection::ConnectionManager;
 use exfetch::bridge::ws_server;
 use exfetch::cli::commands::{Cli, Commands};
+use exfetch::engine::policy::PolicyEngine;
 use exfetch::fetch::http::{fetch_bytes, fetch_url};
 use exfetch::fetch::pdf;
+use exfetch::mcp;
 use exfetch::output;
 use exfetch::search;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    tracing_subscriber::fmt::init();
+
     let cli = Cli::parse();
 
     match cli.command {
@@ -164,17 +169,33 @@ async fn main() -> Result<()> {
             }
         }
         Commands::Serve(args) => {
-            if args.mcp_stdio {
-                eprintln!("MCP stdio mode (not yet implemented)");
-            } else {
-                let token = ws_server::generate_token();
-                let connections = ConnectionManager::new();
+            let connections = ConnectionManager::new();
+            let policy = Arc::new(PolicyEngine::new());
 
+            if args.mcp_stdio {
+                // Run MCP server over stdin/stdout
+                mcp::server::run_stdio(connections, policy).await?;
+            } else {
+                // Start WebSocket server for browser extension bridge
+                let token = ws_server::generate_token();
                 let actual_port =
-                    ws_server::start(args.port, token.clone(), connections).await?;
+                    ws_server::start(args.port, token.clone(), connections.clone()).await?;
 
                 eprintln!("[exfetch] WebSocket server listening on 127.0.0.1:{}", actual_port);
                 eprintln!("[exfetch] auth token: {}", token);
+
+                // Optionally spawn SSE MCP server alongside the WebSocket server
+                if let Some(sse_port) = args.mcp_sse {
+                    let sse_conns = connections.clone();
+                    let sse_policy = policy.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = mcp::server::run_sse(sse_port, sse_conns, sse_policy).await
+                        {
+                            eprintln!("[exfetch] SSE server error: {}", e);
+                        }
+                    });
+                    eprintln!("[exfetch] MCP SSE server listening on 127.0.0.1:{}", sse_port);
+                }
 
                 // Wait for ctrl-c
                 tokio::signal::ctrl_c().await?;
