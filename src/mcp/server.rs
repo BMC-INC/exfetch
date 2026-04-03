@@ -116,20 +116,28 @@ pub async fn run_sse(
 }
 
 /// SSE endpoint: clients connect here to receive JSON-RPC responses as
-/// server-sent events.
+/// server-sent events. Per the MCP SSE transport spec, the first event
+/// sent MUST be an "endpoint" event containing the URL the client should
+/// POST JSON-RPC requests to.
 async fn sse_handler(
     State(state): State<SseState>,
 ) -> Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>> {
     let rx = state.tx.subscribe();
 
-    let stream = tokio_stream::wrappers::BroadcastStream::new(rx).filter_map(|msg| async move {
-        match msg {
-            Ok(data) => Some(Ok(Event::default().data(data))),
-            Err(_) => None,
-        }
-    });
+    // First event: tell the client where to POST messages
+    let endpoint_event =
+        futures_util::stream::once(async { Ok(Event::default().event("endpoint").data("/message")) });
 
-    Sse::new(stream)
+    // Subsequent events: broadcast JSON-RPC responses
+    let response_stream =
+        tokio_stream::wrappers::BroadcastStream::new(rx).filter_map(|msg| async move {
+            match msg {
+                Ok(data) => Some(Ok(Event::default().event("message").data(data))),
+                Err(_) => None,
+            }
+        });
+
+    Sse::new(endpoint_event.chain(response_stream))
 }
 
 /// POST /message endpoint: receives JSON-RPC requests and dispatches them.
