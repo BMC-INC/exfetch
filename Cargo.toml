@@ -21,6 +21,8 @@ anyhow = "1"
 reqwest = { version = "0.12", features = ["rustls-tls", "cookies", "gzip", "brotli", "deflate"] }
 url = "2"
 thiserror = "1"
+scraper = "0.20"
+html2text = "0.12"
 
 [features]
 default = []
