@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "exfetch": {
+      "command": "exfetch",
+      "args": ["serve", "--mcp-stdio"]
+    }
+  }
+}
