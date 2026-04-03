@@ -359,7 +359,7 @@ async fn handle_search_web(
 
 async fn handle_browser_action(
     id: serde_json::Value,
-    _args: &serde_json::Value,
+    args: &serde_json::Value,
     connections: &ConnectionManager,
 ) -> JsonRpcResponse {
     if !connections.has_connections().await {
@@ -370,14 +370,50 @@ async fn handle_browser_action(
         );
     }
 
-    // Bridge routing will be wired in a later task — for now, acknowledge
-    // that the extension is connected but the action pipeline is not yet
-    // implemented.
-    JsonRpcResponse::error(
-        id,
-        -32000,
-        "Browser action bridge routing not yet implemented",
-    )
+    // Extract the action name — this maps directly to a bridge command name
+    let action = match args.get("action").and_then(|v| v.as_str()) {
+        Some(a) => a,
+        None => {
+            return JsonRpcResponse::error(id, -32602, "Missing required parameter: action");
+        }
+    };
+
+    // Build bridge command params from the MCP arguments.
+    // The bridge command name matches the action name.
+    // Pass through all relevant parameters.
+    let bridge_params = serde_json::json!({
+        "selector": args.get("selector"),
+        "text": args.get("text"),
+        "url": args.get("url"),
+        "tab_id": args.get("tab_id"),
+        "code": args.get("code"),
+        "full_page": args.get("full_page"),
+        "domain": args.get("domain"),
+    });
+
+    match connections.send_command(action, bridge_params).await {
+        Ok(result) => {
+            // Check if the extension reported an error
+            if let Some(false) = result.get("success").and_then(|v| v.as_bool()) {
+                let err_msg = result
+                    .get("error")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("Extension returned an error");
+                return JsonRpcResponse::error(id, -32000, err_msg);
+            }
+
+            JsonRpcResponse::success(
+                id,
+                serde_json::json!({
+                    "content": [{
+                        "type": "text",
+                        "text": serde_json::to_string(&result).unwrap_or_default()
+                    }]
+                }),
+            )
+        }
+        Err(e) => JsonRpcResponse::error(id, -32000, format!("Bridge command failed: {}", e)),
+    }
 }
 
 async fn handle_connection_status(

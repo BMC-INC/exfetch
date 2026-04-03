@@ -188,11 +188,16 @@ async fn handle_connection(
             incoming = ws_receiver.next() => {
                 match incoming {
                     Some(Ok(Message::Text(text))) => {
-                        // Try to parse as BridgeMessage — in the future, route to handlers
+                        // Try to parse as BridgeMessage and route responses
                         if let Ok(msg) = serde_json::from_str::<BridgeMessage>(&text) {
                             if msg.msg_type == MessageType::Response {
-                                // TODO: route response to pending request
-                                eprintln!("[exfetch] received response from {}: {}", browser, msg.command);
+                                let completed = connections.pending().complete(&msg.id, msg.params.clone()).await;
+                                if !completed {
+                                    eprintln!(
+                                        "[exfetch] received orphan response from {} for command '{}' (id={})",
+                                        browser, msg.command, msg.id
+                                    );
+                                }
                             }
                         }
                     }
