@@ -1,13 +1,17 @@
 use std::time::Duration;
 
-use exfetch::fetch::http::{fetch_url, FetchError};
+use exfetch::fetch::http::{fetch_url, fetch_url_with_options, FetchError};
 use exfetch::fetch::pdf::{extract_text, PdfError};
 
 #[tokio::test]
 async fn test_fetch_success_returns_body() {
-    let resp = fetch_url("https://httpbin.org/html", Duration::from_secs(15), "exfetch-test/0.1")
-        .await
-        .expect("fetch should succeed");
+    let resp = fetch_url(
+        "https://httpbin.org/html",
+        Duration::from_secs(15),
+        "exfetch-test/0.1",
+    )
+    .await
+    .expect("fetch should succeed");
 
     assert_eq!(resp.status, 200);
     assert!(
@@ -18,9 +22,12 @@ async fn test_fetch_success_returns_body() {
 
 #[tokio::test]
 async fn test_fetch_404_returns_error() {
-    let result =
-        fetch_url("https://httpbin.org/status/404", Duration::from_secs(15), "exfetch-test/0.1")
-            .await;
+    let result = fetch_url(
+        "https://httpbin.org/status/404",
+        Duration::from_secs(15),
+        "exfetch-test/0.1",
+    )
+    .await;
 
     assert!(result.is_err(), "404 should return an error");
     match result.unwrap_err() {
@@ -31,9 +38,13 @@ async fn test_fetch_404_returns_error() {
 
 #[tokio::test]
 async fn test_fetch_auto_prepends_https() {
-    let resp = fetch_url("httpbin.org/html", Duration::from_secs(15), "exfetch-test/0.1")
-        .await
-        .expect("fetch with auto-prepended https should succeed");
+    let resp = fetch_url(
+        "httpbin.org/html",
+        Duration::from_secs(15),
+        "exfetch-test/0.1",
+    )
+    .await
+    .expect("fetch with auto-prepended https should succeed");
 
     assert_eq!(resp.status, 200);
     assert!(resp.body.contains("Herman Melville"));
@@ -41,14 +52,59 @@ async fn test_fetch_auto_prepends_https() {
 
 #[tokio::test]
 async fn test_fetch_timeout() {
-    let result =
-        fetch_url("https://httpbin.org/delay/5", Duration::from_secs(1), "exfetch-test/0.1")
-            .await;
+    let result = fetch_url(
+        "https://httpbin.org/delay/5",
+        Duration::from_secs(1),
+        "exfetch-test/0.1",
+    )
+    .await;
 
     assert!(result.is_err(), "should time out");
     match result.unwrap_err() {
         FetchError::Timeout { .. } => {} // expected
         other => panic!("expected Timeout, got: {:?}", other),
+    }
+}
+
+// ─── SSRF protection tests ──────────────────────────────────────────
+
+#[tokio::test]
+async fn test_ssrf_blocks_localhost() {
+    let result = fetch_url_with_options(
+        "http://127.0.0.1:8080",
+        Duration::from_secs(5),
+        "exfetch-test/0.1",
+        false,
+    )
+    .await;
+
+    assert!(
+        result.is_err(),
+        "localhost should be blocked by SSRF protection"
+    );
+    match result.unwrap_err() {
+        FetchError::SsrfBlocked { .. } => {} // expected
+        other => panic!("expected SsrfBlocked, got: {:?}", other),
+    }
+}
+
+#[tokio::test]
+async fn test_ssrf_blocks_private_ip() {
+    let result = fetch_url_with_options(
+        "http://192.168.1.1",
+        Duration::from_secs(5),
+        "exfetch-test/0.1",
+        false,
+    )
+    .await;
+
+    assert!(
+        result.is_err(),
+        "private IP should be blocked by SSRF protection"
+    );
+    match result.unwrap_err() {
+        FetchError::SsrfBlocked { .. } => {} // expected
+        other => panic!("expected SsrfBlocked, got: {:?}", other),
     }
 }
 

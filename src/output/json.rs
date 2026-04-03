@@ -32,7 +32,6 @@ pub fn format(response: &FetchResponse, max_length: Option<usize>) -> String {
         fetch_time_ms: response.fetch_time_ms,
     };
 
-    serde_json::to_string_pretty(&output).unwrap_or_else(|e| {
-        format!("{{\"error\": \"JSON serialization failed: {}\"}}", e)
-    })
+    serde_json::to_string_pretty(&output)
+        .unwrap_or_else(|e| format!("{{\"error\": \"JSON serialization failed: {}\"}}", e))
 }

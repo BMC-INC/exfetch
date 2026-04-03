@@ -30,10 +30,7 @@ use super::types::{JsonRpcRequest, JsonRpcResponse};
 
 /// Run the MCP server reading JSON-RPC messages line-by-line from stdin and
 /// writing responses to stdout.
-pub async fn run_stdio(
-    connections: ConnectionManager,
-    policy: Arc<PolicyEngine>,
-) -> Result<()> {
+pub async fn run_stdio(connections: ConnectionManager, policy: Arc<PolicyEngine>) -> Result<()> {
     let stdin = tokio::io::stdin();
     let mut stdout = tokio::io::stdout();
     let reader = BufReader::new(stdin);
@@ -226,10 +223,7 @@ async fn handle_tools_call(
     params: &serde_json::Value,
     connections: &ConnectionManager,
 ) -> JsonRpcResponse {
-    let tool_name = params
-        .get("name")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let tool_name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
 
     let arguments = params
         .get("arguments")
@@ -249,10 +243,7 @@ async fn handle_tools_call(
 // Tool handlers
 // ---------------------------------------------------------------------------
 
-async fn handle_fetch_page(
-    id: serde_json::Value,
-    args: &serde_json::Value,
-) -> JsonRpcResponse {
+async fn handle_fetch_page(id: serde_json::Value, args: &serde_json::Value) -> JsonRpcResponse {
     let url = match args.get("url").and_then(|v| v.as_str()) {
         Some(u) => u,
         None => return JsonRpcResponse::error(id, -32602, "Missing required parameter: url"),
@@ -263,16 +254,19 @@ async fn handle_fetch_page(
         .and_then(|v| v.as_str())
         .unwrap_or("markdown");
 
-    let max_length = args.get("max_length").and_then(|v| v.as_u64()).map(|n| n as usize);
+    let max_length = Some(
+        args.get("max_length")
+            .and_then(|v| v.as_u64())
+            .map(|n| n as usize)
+            .unwrap_or(500_000),
+    );
 
     let timeout = Duration::from_secs(15);
 
     match fetch_url(url, timeout, "exfetch/0.1").await {
         Ok(resp) => {
             let content = match format {
-                "html" | "raw" => {
-                    output::text::format_raw(&resp.body, max_length)
-                }
+                "html" | "raw" => output::text::format_raw(&resp.body, max_length),
                 "text" => {
                     let extracted = readability::extract(&resp.body);
                     output::text::format_raw(&extracted, max_length)
@@ -296,10 +290,7 @@ async fn handle_fetch_page(
     }
 }
 
-async fn handle_search_web(
-    id: serde_json::Value,
-    args: &serde_json::Value,
-) -> JsonRpcResponse {
+async fn handle_search_web(id: serde_json::Value, args: &serde_json::Value) -> JsonRpcResponse {
     let query = match args.get("query").and_then(|v| v.as_str()) {
         Some(q) => q,
         None => return JsonRpcResponse::error(id, -32602, "Missing required parameter: query"),

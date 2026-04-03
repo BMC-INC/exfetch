@@ -6,6 +6,7 @@ use clap::Parser;
 use exfetch::bridge::connection::ConnectionManager;
 use exfetch::bridge::ws_server;
 use exfetch::cli::commands::{Cli, Commands};
+use exfetch::config;
 use exfetch::engine::policy::PolicyEngine;
 use exfetch::fetch::http::{fetch_bytes, fetch_url};
 use exfetch::fetch::pdf;
@@ -36,7 +37,10 @@ async fn main() -> Result<()> {
                                 resp.status, resp.final_url, resp.fetch_time_ms
                             );
                             eprintln!("[exfetch] content-type: {}", resp.content_type);
-                            eprintln!("[exfetch] mode: PDF extraction ({} bytes)", resp.bytes.len());
+                            eprintln!(
+                                "[exfetch] mode: PDF extraction ({} bytes)",
+                                resp.bytes.len()
+                            );
                         }
 
                         match pdf::extract_text(&resp.bytes) {
@@ -71,18 +75,16 @@ async fn main() -> Result<()> {
                             }
 
                             match fetch_bytes(&args.url, timeout, &args.user_agent).await {
-                                Ok(bytes_resp) => {
-                                    match pdf::extract_text(&bytes_resp.bytes) {
-                                        Ok(text) => {
-                                            let out = output::text::format_raw(&text, args.max_length);
-                                            println!("{}", out);
-                                        }
-                                        Err(e) => {
-                                            eprintln!("error: PDF text extraction failed: {}", e);
-                                            std::process::exit(1);
-                                        }
+                                Ok(bytes_resp) => match pdf::extract_text(&bytes_resp.bytes) {
+                                    Ok(text) => {
+                                        let out = output::text::format_raw(&text, args.max_length);
+                                        println!("{}", out);
                                     }
-                                }
+                                    Err(e) => {
+                                        eprintln!("error: PDF text extraction failed: {}", e);
+                                        std::process::exit(1);
+                                    }
+                                },
                                 Err(e) => {
                                     eprintln!("error: {}", e);
                                     std::process::exit(1);
@@ -99,6 +101,17 @@ async fn main() -> Result<()> {
 
                             let out = if args.raw {
                                 resp.body.clone()
+                            } else if resp
+                                .content_type
+                                .to_lowercase()
+                                .contains("application/json")
+                            {
+                                // JSON content: pretty-print directly without extraction
+                                match serde_json::from_str::<serde_json::Value>(&resp.body) {
+                                    Ok(parsed) => serde_json::to_string_pretty(&parsed)
+                                        .unwrap_or_else(|_| resp.body.clone()),
+                                    Err(_) => resp.body.clone(),
+                                }
                             } else if args.json {
                                 output::json::format(&resp, args.max_length)
                             } else if args.markdown {
@@ -124,8 +137,7 @@ async fn main() -> Result<()> {
             if args.fetch {
                 // Search + fetch top results
                 let fetch_count = std::cmp::min(3, num_results);
-                match search::search_and_fetch(&args.query, num_results, fetch_count, timeout)
-                    .await
+                match search::search_and_fetch(&args.query, num_results, fetch_count, timeout).await
                 {
                     Ok(results) => {
                         if results.is_empty() {
@@ -146,8 +158,26 @@ async fn main() -> Result<()> {
                     }
                 }
             } else {
-                // Search only (no fetch)
-                match search::engine::search_ddg(&args.query, num_results, timeout).await {
+                // Search only (no fetch) -- select engine based on --engine flag
+                let search_result = match args.engine.as_str() {
+                    "searxng" => {
+                        let instance_url =
+                            args.searxng_url.as_deref().unwrap_or("https://searx.be");
+                        search::engine::search_searxng(
+                            &args.query,
+                            num_results,
+                            timeout,
+                            instance_url,
+                        )
+                        .await
+                    }
+                    _ => {
+                        // Default: DuckDuckGo
+                        search::engine::search_ddg(&args.query, num_results, timeout).await
+                    }
+                };
+
+                match search_result {
                     Ok(results) => {
                         if results.is_empty() {
                             if !args.quiet {
@@ -169,6 +199,39 @@ async fn main() -> Result<()> {
             }
         }
         Commands::Serve(args) => {
+            // Daemon mode: fork to background before starting anything
+            if args.daemon && !args.mcp_stdio {
+                let config_dir = config::config_dir();
+                std::fs::create_dir_all(&config_dir)?;
+
+                let data_dir = dirs::data_local_dir()
+                    .unwrap_or_else(|| std::path::PathBuf::from("."))
+                    .join("exfetch");
+                std::fs::create_dir_all(&data_dir)?;
+
+                let pid_file = config_dir.join("exfetch.pid");
+                let log_file = data_dir.join("exfetch.log");
+
+                let stdout = std::fs::File::create(&log_file)?;
+                let stderr = stdout.try_clone()?;
+
+                let daemonize = daemonize::Daemonize::new()
+                    .pid_file(&pid_file)
+                    .working_directory(".")
+                    .stdout(stdout)
+                    .stderr(stderr);
+
+                match daemonize.start() {
+                    Ok(_) => {
+                        // We are now in the child process -- fall through to server startup
+                    }
+                    Err(e) => {
+                        eprintln!("error: failed to daemonize: {}", e);
+                        std::process::exit(1);
+                    }
+                }
+            }
+
             let connections = ConnectionManager::new();
             let policy = Arc::new(PolicyEngine::new());
 
@@ -181,7 +244,10 @@ async fn main() -> Result<()> {
                 let actual_port =
                     ws_server::start(args.port, token.clone(), connections.clone()).await?;
 
-                eprintln!("[exfetch] WebSocket server listening on 127.0.0.1:{}", actual_port);
+                eprintln!(
+                    "[exfetch] WebSocket server listening on 127.0.0.1:{}",
+                    actual_port
+                );
                 eprintln!("[exfetch] auth token: {}", token);
 
                 // Optionally spawn SSE MCP server alongside the WebSocket server
@@ -194,7 +260,10 @@ async fn main() -> Result<()> {
                             eprintln!("[exfetch] SSE server error: {}", e);
                         }
                     });
-                    eprintln!("[exfetch] MCP SSE server listening on 127.0.0.1:{}", sse_port);
+                    eprintln!(
+                        "[exfetch] MCP SSE server listening on 127.0.0.1:{}",
+                        sse_port
+                    );
                 }
 
                 // Wait for ctrl-c
@@ -203,8 +272,42 @@ async fn main() -> Result<()> {
             }
         }
         Commands::Status => {
-            println!("exfetch status");
-            println!("  [placeholder] status not yet implemented");
+            let pid_file = config::config_dir().join("exfetch.pid");
+            if pid_file.exists() {
+                match std::fs::read_to_string(&pid_file) {
+                    Ok(contents) => {
+                        let pid_str = contents.trim();
+                        match pid_str.parse::<u32>() {
+                            Ok(pid) => {
+                                // Check if the process is still running
+                                let sys = sysinfo::System::new_all();
+                                let pid_val = sysinfo::Pid::from_u32(pid);
+                                if sys.process(pid_val).is_some() {
+                                    println!("exfetch daemon: running (PID {})", pid);
+                                } else {
+                                    println!("exfetch daemon: not running (stale PID file, PID {} not found)", pid);
+                                }
+                            }
+                            Err(_) => {
+                                println!("exfetch daemon: unknown (invalid PID file)");
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        println!("exfetch daemon: unknown (cannot read PID file: {})", e);
+                    }
+                }
+            } else {
+                println!("exfetch daemon: not running (no PID file)");
+            }
+
+            // Show port file if it exists
+            let port_file = config::config_dir().join("port");
+            if let Ok(port_str) = std::fs::read_to_string(&port_file) {
+                println!("  WebSocket port: {}", port_str.trim());
+            }
+
+            println!("  version: {}", env!("CARGO_PKG_VERSION"));
         }
     }
 

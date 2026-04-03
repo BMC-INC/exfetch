@@ -69,9 +69,7 @@ fn count_words(document: &Html) -> usize {
         None => return 0,
     };
 
-    root.text()
-        .flat_map(|t| t.split_whitespace())
-        .count()
+    root.text().flat_map(|t| t.split_whitespace()).count()
 }
 
 #[cfg(test)]
@@ -97,7 +95,10 @@ mod tests {
         let meta = extract(html);
         assert_eq!(meta.og_title.as_deref(), Some("OG Title"));
         assert_eq!(meta.og_description.as_deref(), Some("OG Desc"));
-        assert_eq!(meta.og_image.as_deref(), Some("https://example.com/img.png"));
+        assert_eq!(
+            meta.og_image.as_deref(),
+            Some("https://example.com/img.png")
+        );
     }
 
     #[test]

@@ -105,6 +105,25 @@ fn test_truncation_at_word_boundary() {
 }
 
 #[test]
+fn test_readability_fallback_on_empty_extraction() {
+    // HTML where content selectors would yield empty but body has text
+    let html = r#"<html><body><div class="weird-layout">
+        <span>Some important content here</span>
+    </div></body></html>"#;
+    let text = readability::extract(html);
+    // Should get some content via fallback even if no main/article found
+    assert!(
+        !text.is_empty(),
+        "readability should fall back to full-body extraction"
+    );
+    assert!(
+        text.contains("important content"),
+        "should contain body text, got: {}",
+        text
+    );
+}
+
+#[test]
 fn test_markdown_preserves_headers_and_links() {
     let html = load_fixture("article_with_formatting.html");
     let md = markdown::to_markdown(&html);

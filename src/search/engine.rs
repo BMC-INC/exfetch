@@ -119,6 +119,75 @@ pub async fn search_ddg(
     Ok(results)
 }
 
+/// Search a SearXNG instance and return parsed results.
+///
+/// Sends a GET request to `{instance_url}/search?q={query}&format=json`,
+/// parses the JSON response, and returns up to `num_results` results.
+pub async fn search_searxng(
+    query: &str,
+    num_results: usize,
+    timeout: Duration,
+    instance_url: &str,
+) -> Result<Vec<SearchResult>> {
+    let url = format!(
+        "{}/search?q={}&format=json",
+        instance_url.trim_end_matches('/'),
+        urlencoding::encode(query)
+    );
+
+    let client = reqwest::Client::builder()
+        .timeout(timeout)
+        .user_agent("exfetch/0.1")
+        .build()
+        .context("failed to build HTTP client")?;
+
+    let response = client
+        .get(&url)
+        .send()
+        .await
+        .context("SearXNG search request failed")?;
+
+    let body = response
+        .text()
+        .await
+        .context("failed to read SearXNG response body")?;
+
+    let parsed: serde_json::Value =
+        serde_json::from_str(&body).context("failed to parse SearXNG JSON response")?;
+
+    let mut results = Vec::new();
+
+    if let Some(arr) = parsed.get("results").and_then(|v| v.as_array()) {
+        for item in arr.iter().take(num_results) {
+            let title = item
+                .get("title")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let result_url = item
+                .get("url")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let snippet = item
+                .get("content")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+
+            if !title.is_empty() && !result_url.is_empty() {
+                results.push(SearchResult {
+                    title,
+                    url: result_url,
+                    snippet,
+                });
+            }
+        }
+    }
+
+    Ok(results)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

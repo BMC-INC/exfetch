@@ -16,14 +16,13 @@ pub enum PdfError {
 /// and concatenates extracted text. Returns `PdfError::NoText` if the
 /// resulting text is empty after trimming whitespace.
 pub fn extract_text(bytes: &[u8]) -> Result<String, PdfError> {
-    let doc =
-        lopdf::Document::load_mem(bytes).map_err(|e| PdfError::ParseError(e.to_string()))?;
+    let doc = lopdf::Document::load_mem(bytes).map_err(|e| PdfError::ParseError(e.to_string()))?;
 
     let pages = doc.get_pages();
     let mut all_text = String::new();
 
     // Pages are returned as BTreeMap<u32, ObjectId>; iterate in page order
-    for (&page_num, _) in &pages {
+    for &page_num in pages.keys() {
         match doc.extract_text(&[page_num]) {
             Ok(text) => {
                 if !all_text.is_empty() && !text.is_empty() {

@@ -1,3 +1,4 @@
+use std::net::IpAddr;
 use std::time::{Duration, Instant};
 
 use reqwest::redirect::Policy;
@@ -35,6 +36,69 @@ pub enum FetchError {
 
     #[error("invalid URL: {0}")]
     InvalidUrl(String),
+
+    #[error("SSRF blocked: request to private/reserved IP {ip}")]
+    SsrfBlocked { ip: String },
+}
+
+/// Check whether an IP address belongs to a private, loopback, link-local,
+/// or otherwise reserved range that should not be accessed in server-side
+/// request scenarios (SSRF protection).
+pub fn is_private_ip(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            v4.is_loopback()                          // 127.0.0.0/8
+                || v4.is_private()                     // 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16
+                || v4.is_link_local()                  // 169.254.0.0/16
+                || v4.octets() == [0, 0, 0, 0]        // 0.0.0.0
+                || v4.is_broadcast() // 255.255.255.255
+        }
+        IpAddr::V6(v6) => {
+            v6.is_loopback()                           // ::1
+                || {
+                    // Link-local fe80::/10
+                    let segs = v6.segments();
+                    (segs[0] & 0xffc0) == 0xfe80
+                }
+                || {
+                    // Unique local fc00::/7
+                    let segs = v6.segments();
+                    (segs[0] & 0xfe00) == 0xfc00
+                }
+                || v6.is_unspecified() // ::
+        }
+    }
+}
+
+/// Resolve the hostname of a URL and check that all resolved IPs are
+/// non-private. Returns `Err(FetchError::SsrfBlocked)` if any resolved
+/// address is in a private/reserved range.
+async fn check_ssrf(url: &Url, allow_private: bool) -> Result<(), FetchError> {
+    if allow_private {
+        return Ok(());
+    }
+
+    let host = match url.host_str() {
+        Some(h) => h,
+        None => return Err(FetchError::InvalidUrl("no host in URL".to_string())),
+    };
+
+    let port = url.port_or_known_default().unwrap_or(443);
+    let addr_str = format!("{}:{}", host, port);
+
+    let addrs = tokio::net::lookup_host(&addr_str)
+        .await
+        .map_err(|e| FetchError::Network(format!("DNS lookup failed for {}: {}", host, e)))?;
+
+    for addr in addrs {
+        if is_private_ip(&addr.ip()) {
+            return Err(FetchError::SsrfBlocked {
+                ip: addr.ip().to_string(),
+            });
+        }
+    }
+
+    Ok(())
 }
 
 /// Normalize a raw URL string into a proper `Url`.
@@ -68,12 +132,27 @@ fn is_allowed_content_type(ct: &str) -> bool {
 /// Fetch a URL with the given timeout and user-agent.
 ///
 /// Follows up to 10 redirects, rejects 4xx/5xx responses, and rejects binary content types.
+/// By default, requests to private/reserved IP ranges are blocked (SSRF protection).
+/// Pass `allow_private = true` to disable this check.
 pub async fn fetch_url(
     raw_url: &str,
     timeout: Duration,
     user_agent: &str,
 ) -> Result<FetchResponse, FetchError> {
+    fetch_url_with_options(raw_url, timeout, user_agent, false).await
+}
+
+/// Like [`fetch_url`] but with an explicit `allow_private` flag for SSRF control.
+pub async fn fetch_url_with_options(
+    raw_url: &str,
+    timeout: Duration,
+    user_agent: &str,
+    allow_private: bool,
+) -> Result<FetchResponse, FetchError> {
     let url = normalize_url(raw_url)?;
+
+    // SSRF check: resolve hostname and reject private IPs
+    check_ssrf(&url, allow_private).await?;
 
     let client = reqwest::Client::builder()
         .timeout(timeout)
@@ -261,5 +340,79 @@ mod tests {
     fn test_is_allowed_content_type_binary_rejected() {
         assert!(!is_allowed_content_type("image/png"));
         assert!(!is_allowed_content_type("application/octet-stream"));
+    }
+
+    // SSRF / is_private_ip tests
+
+    #[test]
+    fn test_is_private_ip_loopback_v4() {
+        let ip: IpAddr = "127.0.0.1".parse().unwrap();
+        assert!(is_private_ip(&ip));
+    }
+
+    #[test]
+    fn test_is_private_ip_loopback_v6() {
+        let ip: IpAddr = "::1".parse().unwrap();
+        assert!(is_private_ip(&ip));
+    }
+
+    #[test]
+    fn test_is_private_ip_10_range() {
+        let ip: IpAddr = "10.0.0.1".parse().unwrap();
+        assert!(is_private_ip(&ip));
+    }
+
+    #[test]
+    fn test_is_private_ip_172_range() {
+        let ip: IpAddr = "172.16.0.1".parse().unwrap();
+        assert!(is_private_ip(&ip));
+        let ip2: IpAddr = "172.31.255.255".parse().unwrap();
+        assert!(is_private_ip(&ip2));
+    }
+
+    #[test]
+    fn test_is_private_ip_192_168_range() {
+        let ip: IpAddr = "192.168.1.1".parse().unwrap();
+        assert!(is_private_ip(&ip));
+    }
+
+    #[test]
+    fn test_is_private_ip_link_local() {
+        let ip: IpAddr = "169.254.1.1".parse().unwrap();
+        assert!(is_private_ip(&ip));
+    }
+
+    #[test]
+    fn test_is_private_ip_zero() {
+        let ip: IpAddr = "0.0.0.0".parse().unwrap();
+        assert!(is_private_ip(&ip));
+    }
+
+    #[test]
+    fn test_is_private_ip_public() {
+        let ip: IpAddr = "8.8.8.8".parse().unwrap();
+        assert!(!is_private_ip(&ip));
+        let ip2: IpAddr = "1.1.1.1".parse().unwrap();
+        assert!(!is_private_ip(&ip2));
+    }
+
+    #[test]
+    fn test_is_private_ip_v6_link_local() {
+        let ip: IpAddr = "fe80::1".parse().unwrap();
+        assert!(is_private_ip(&ip));
+    }
+
+    #[test]
+    fn test_is_private_ip_v6_unique_local() {
+        let ip: IpAddr = "fc00::1".parse().unwrap();
+        assert!(is_private_ip(&ip));
+        let ip2: IpAddr = "fd00::1".parse().unwrap();
+        assert!(is_private_ip(&ip2));
+    }
+
+    #[test]
+    fn test_is_private_ip_v6_public() {
+        let ip: IpAddr = "2606:4700::1111".parse().unwrap();
+        assert!(!is_private_ip(&ip));
     }
 }

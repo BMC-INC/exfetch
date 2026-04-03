@@ -3,22 +3,12 @@ use std::path::PathBuf;
 use serde::Deserialize;
 
 /// Top-level configuration loaded from `~/.config/exfetch/config.toml`.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct Config {
     pub defaults: Defaults,
     pub policy: PolicyConfig,
     pub tabs: TabConfig,
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            defaults: Defaults::default(),
-            policy: PolicyConfig::default(),
-            tabs: TabConfig::default(),
-        }
-    }
 }
 
 /// Default settings for fetch and search operations.

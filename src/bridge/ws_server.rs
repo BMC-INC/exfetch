@@ -68,17 +68,12 @@ pub async fn start_test_server() -> (u16, String) {
     let tok = token.clone();
     let conns = connections.clone();
     tokio::spawn(async move {
-        loop {
-            match listener.accept().await {
-                Ok((stream, addr)) => {
-                    let tok = tok.clone();
-                    let conns = conns.clone();
-                    tokio::spawn(async move {
-                        let _ = handle_connection(stream, addr, tok, conns).await;
-                    });
-                }
-                Err(_) => break,
-            }
+        while let Ok((stream, addr)) = listener.accept().await {
+            let tok = tok.clone();
+            let conns = conns.clone();
+            tokio::spawn(async move {
+                let _ = handle_connection(stream, addr, tok, conns).await;
+            });
         }
     });
 
@@ -116,11 +111,8 @@ async fn handle_connection(
     let (mut ws_sender, mut ws_receiver) = ws_stream.split();
 
     // Wait up to 5 seconds for auth message
-    let auth_result = tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        ws_receiver.next(),
-    )
-    .await;
+    let auth_result =
+        tokio::time::timeout(std::time::Duration::from_secs(5), ws_receiver.next()).await;
 
     let auth_msg = match auth_result {
         Ok(Some(Ok(Message::Text(text)))) => text,
@@ -129,7 +121,7 @@ async fn handle_connection(
                 "status": "error",
                 "reason": "auth timeout or invalid message"
             });
-            let _ = ws_sender.send(Message::Text(reject.to_string().into())).await;
+            let _ = ws_sender.send(Message::Text(reject.to_string())).await;
             let _ = ws_sender.close().await;
             return Err(anyhow::anyhow!("auth timeout from {}", addr));
         }
@@ -145,7 +137,7 @@ async fn handle_connection(
             "status": "rejected",
             "reason": "invalid token"
         });
-        let _ = ws_sender.send(Message::Text(reject.to_string().into())).await;
+        let _ = ws_sender.send(Message::Text(reject.to_string())).await;
         let _ = ws_sender.close().await;
         return Err(anyhow::anyhow!("invalid token from {}", addr));
     }
@@ -179,7 +171,7 @@ async fn handle_connection(
         "status": "authenticated",
         "connection_id": conn_id,
     });
-    ws_sender.send(Message::Text(ack.to_string().into())).await?;
+    ws_sender.send(Message::Text(ack.to_string())).await?;
 
     // Bidirectional message forwarding
     loop {
@@ -213,7 +205,7 @@ async fn handle_connection(
             outgoing = rx.recv() => {
                 match outgoing {
                     Some(text) => {
-                        if ws_sender.send(Message::Text(text.into())).await.is_err() {
+                        if ws_sender.send(Message::Text(text)).await.is_err() {
                             break;
                         }
                     }

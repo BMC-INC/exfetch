@@ -18,7 +18,7 @@ async fn test_ws_server_accepts_authenticated_connection() {
         "browser": "test",
         "profile": "default"
     });
-    ws.send(Message::Text(auth.to_string().into()))
+    ws.send(Message::Text(auth.to_string()))
         .await
         .expect("failed to send auth");
 
@@ -61,7 +61,7 @@ async fn test_ws_server_rejects_bad_token() {
         "token": "wrong-token-value",
         "browser": "test",
     });
-    ws.send(Message::Text(auth.to_string().into()))
+    ws.send(Message::Text(auth.to_string()))
         .await
         .expect("failed to send auth");
 

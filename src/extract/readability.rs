@@ -48,7 +48,15 @@ pub fn extract(html: &str) -> String {
 
     // Convert to plain text.
     let plain = html2text::from_read(cleaned.as_bytes(), 80);
-    plain.trim().to_string()
+    let trimmed = plain.trim().to_string();
+
+    // If extraction returned empty/whitespace, fall back to html2text on full body
+    if trimmed.is_empty() {
+        let fallback = html2text::from_read(html.as_bytes(), 80);
+        return fallback.trim().to_string();
+    }
+
+    trimmed
 }
 
 /// Return the inner HTML of the first matching content selector,
