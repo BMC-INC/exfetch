@@ -121,12 +121,28 @@ pub async fn run_sse(
 /// POST JSON-RPC requests to.
 async fn sse_handler(
     State(state): State<SseState>,
-) -> Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>> {
+    req: axum::http::Request<axum::body::Body>,
+) -> impl IntoResponse {
     let rx = state.tx.subscribe();
 
+    // Build the full message endpoint URL from the incoming request
+    // so it works through tunnels/proxies
+    let scheme = req
+        .headers()
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("http");
+    let host = req
+        .headers()
+        .get("host")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("localhost:9877");
+    let message_url = format!("{}://{}/message", scheme, host);
+
     // First event: tell the client where to POST messages
-    let endpoint_event =
-        futures_util::stream::once(async { Ok(Event::default().event("endpoint").data("/message")) });
+    let endpoint_event = futures_util::stream::once(async move {
+        Ok::<_, std::convert::Infallible>(Event::default().event("endpoint").data(message_url))
+    });
 
     // Subsequent events: broadcast JSON-RPC responses
     let response_stream =
@@ -137,7 +153,9 @@ async fn sse_handler(
             }
         });
 
+    // Keep-alive every 15 seconds to prevent proxy/CDN buffering
     Sse::new(endpoint_event.chain(response_stream))
+        .keep_alive(axum::response::sse::KeepAlive::new().interval(std::time::Duration::from_secs(15)))
 }
 
 /// POST /message endpoint: receives JSON-RPC requests and dispatches them.
