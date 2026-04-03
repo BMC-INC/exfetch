@@ -2,6 +2,8 @@ use std::time::Duration;
 
 use anyhow::Result;
 use clap::Parser;
+use exfetch::bridge::connection::ConnectionManager;
+use exfetch::bridge::ws_server;
 use exfetch::cli::commands::{Cli, Commands};
 use exfetch::fetch::http::{fetch_bytes, fetch_url};
 use exfetch::fetch::pdf;
@@ -162,18 +164,22 @@ async fn main() -> Result<()> {
             }
         }
         Commands::Serve(args) => {
-            println!("serve: port={}", args.port);
             if args.mcp_stdio {
-                println!("  mode: MCP over stdio");
-            } else if let Some(sse_port) = args.mcp_sse {
-                println!("  mode: MCP over SSE (port {})", sse_port);
+                eprintln!("MCP stdio mode (not yet implemented)");
             } else {
-                println!("  mode: HTTP");
+                let token = ws_server::generate_token();
+                let connections = ConnectionManager::new();
+
+                let actual_port =
+                    ws_server::start(args.port, token.clone(), connections).await?;
+
+                eprintln!("[exfetch] WebSocket server listening on 127.0.0.1:{}", actual_port);
+                eprintln!("[exfetch] auth token: {}", token);
+
+                // Wait for ctrl-c
+                tokio::signal::ctrl_c().await?;
+                eprintln!("\n[exfetch] shutting down");
             }
-            if args.daemon {
-                println!("  daemon: true");
-            }
-            println!("  [placeholder] serve not yet implemented");
         }
         Commands::Status => {
             println!("exfetch status");
