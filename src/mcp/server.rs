@@ -103,9 +103,10 @@ pub async fn run_sse(
     };
 
     let app = Router::new()
-        .route("/", get(sse_handler.clone()))
+        .route("/", get(sse_handler.clone()).post(mcp_handler.clone()))
         .route("/sse", get(sse_handler))
-        .route("/message", post(message_handler))
+        .route("/mcp", post(mcp_handler.clone()))
+        .route("/message", post(message_handler).post(mcp_handler))
         .with_state(state);
 
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
@@ -199,6 +200,69 @@ async fn message_handler(
         Some(resp) => Json(serde_json::to_value(&resp).unwrap_or(serde_json::Value::Null)),
         None => Json(serde_json::json!({"status": "ok"})),
     }
+}
+
+/// Streamable HTTP MCP handler (newer transport).
+/// Accepts POST with JSON-RPC, returns response as SSE stream or JSON.
+/// This is the transport claude.ai prefers for remote MCP servers.
+async fn mcp_handler(
+    State(state): State<SseState>,
+    req: axum::http::Request<axum::body::Body>,
+) -> impl IntoResponse {
+    // Parse the body as JSON-RPC
+    let body_bytes = match axum::body::to_bytes(req.into_body(), 1024 * 1024).await {
+        Ok(b) => b,
+        Err(_) => {
+            return axum::http::Response::builder()
+                .status(400)
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    r#"{"jsonrpc":"2.0","error":{"code":-32700,"message":"Parse error"}}"#,
+                ))
+                .unwrap();
+        }
+    };
+
+    let request: JsonRpcRequest = match serde_json::from_slice(&body_bytes) {
+        Ok(r) => r,
+        Err(e) => {
+            return axum::http::Response::builder()
+                .status(400)
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    format!(r#"{{"jsonrpc":"2.0","error":{{"code":-32700,"message":"Parse error: {}"}}}}"#, e),
+                ))
+                .unwrap();
+        }
+    };
+
+    let response = handle_request(&request, &state.connections, &state.policy).await;
+
+    // For notifications (no id), return 202 Accepted
+    if request.id.is_none() {
+        return axum::http::Response::builder()
+            .status(202)
+            .body(axum::body::Body::empty())
+            .unwrap();
+    }
+
+    // Return as SSE stream (single event, then close) — this is what Streamable HTTP expects
+    let resp_json = match response {
+        Some(resp) => serde_json::to_string(&resp).unwrap_or_default(),
+        None => return axum::http::Response::builder()
+            .status(202)
+            .body(axum::body::Body::empty())
+            .unwrap(),
+    };
+
+    let sse_body = format!("event: message\ndata: {}\n\n", resp_json);
+
+    axum::http::Response::builder()
+        .status(200)
+        .header("content-type", "text/event-stream")
+        .header("cache-control", "no-cache")
+        .body(axum::body::Body::from(sse_body))
+        .unwrap()
 }
 
 // ---------------------------------------------------------------------------
