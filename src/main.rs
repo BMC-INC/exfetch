@@ -1,6 +1,9 @@
+use std::time::Duration;
+
 use anyhow::Result;
 use clap::Parser;
 use exfetch::cli::commands::{Cli, Commands};
+use exfetch::fetch::http::fetch_url;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -8,8 +11,23 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Commands::Fetch(args) => {
-            println!("fetch: url={} timeout={}s", args.url, args.timeout);
-            println!("  [placeholder] fetch not yet implemented");
+            let timeout = Duration::from_secs(args.timeout);
+            match fetch_url(&args.url, timeout, &args.user_agent).await {
+                Ok(resp) => {
+                    if args.verbose {
+                        eprintln!(
+                            "[exfetch] {} {} ({} ms)",
+                            resp.status, resp.final_url, resp.fetch_time_ms
+                        );
+                        eprintln!("[exfetch] content-type: {}", resp.content_type);
+                    }
+                    println!("{}", resp.body);
+                }
+                Err(e) => {
+                    eprintln!("error: {}", e);
+                    std::process::exit(1);
+                }
+            }
         }
         Commands::Search(args) => {
             println!(
