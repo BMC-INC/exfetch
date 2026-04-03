@@ -115,18 +115,13 @@ pub async fn run_sse(
     Ok(())
 }
 
-/// SSE endpoint: clients connect here to receive JSON-RPC responses as
-/// server-sent events. Per the MCP SSE transport spec, the first event
-/// sent MUST be an "endpoint" event containing the URL the client should
-/// POST JSON-RPC requests to.
+/// SSE endpoint using a raw streaming body to ensure immediate flush
+/// through Cloudflare and other reverse proxies.
 async fn sse_handler(
     State(state): State<SseState>,
     req: axum::http::Request<axum::body::Body>,
 ) -> impl IntoResponse {
-    let rx = state.tx.subscribe();
-
     // Build the full message endpoint URL from the incoming request
-    // so it works through tunnels/proxies
     let scheme = req
         .headers()
         .get("x-forwarded-proto")
@@ -139,32 +134,49 @@ async fn sse_handler(
         .unwrap_or("localhost:9877");
     let message_url = format!("{}://{}/message", scheme, host);
 
-    // First event: tell the client where to POST messages
-    let endpoint_event = futures_util::stream::once(async move {
-        Ok::<_, std::convert::Infallible>(Event::default().event("endpoint").data(message_url))
-    });
+    let rx = state.tx.subscribe();
 
-    // Subsequent events: broadcast JSON-RPC responses
-    let response_stream =
-        tokio_stream::wrappers::BroadcastStream::new(rx).filter_map(|msg| async move {
-            match msg {
-                Ok(data) => Some(Ok(Event::default().event("message").data(data))),
-                Err(_) => None,
+    let stream = async_stream::stream! {
+        // Send endpoint event immediately
+        yield Ok::<_, std::convert::Infallible>(
+            format!("event: endpoint\ndata: {}\n\n", message_url)
+        );
+
+        // Send a padding comment to force Cloudflare to flush
+        // Cloudflare buffers small responses; sending >1KB forces a flush
+        let padding = ": ".to_string() + &" ".repeat(2048) + "\n\n";
+        yield Ok(padding);
+
+        // Keep-alive + response events
+        let mut rx = rx;
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(15));
+        loop {
+            tokio::select! {
+                msg = rx.recv() => {
+                    match msg {
+                        Ok(data) => {
+                            yield Ok(format!("event: message\ndata: {}\n\n", data));
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(_) => break,
+                    }
+                }
+                _ = interval.tick() => {
+                    yield Ok(": keepalive\n\n".to_string());
+                }
             }
-        });
+        }
+    };
 
-    // Keep-alive every 15 seconds to prevent proxy/CDN buffering
-    let sse = Sse::new(endpoint_event.chain(response_stream))
-        .keep_alive(axum::response::sse::KeepAlive::new().interval(std::time::Duration::from_secs(15)));
+    let body = axum::body::Body::from_stream(stream);
 
-    // Add headers to prevent buffering by reverse proxies (Cloudflare, nginx, etc.)
-    (
-        [
-            (axum::http::header::CACHE_CONTROL, "no-cache, no-transform"),
-            (axum::http::HeaderName::from_static("x-accel-buffering"), "no"),
-        ],
-        sse,
-    )
+    axum::http::Response::builder()
+        .header("content-type", "text/event-stream")
+        .header("cache-control", "no-cache, no-transform")
+        .header("x-accel-buffering", "no")
+        .header("connection", "keep-alive")
+        .body(body)
+        .unwrap()
 }
 
 /// POST /message endpoint: receives JSON-RPC requests and dispatches them.
