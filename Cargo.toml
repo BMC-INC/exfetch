@@ -20,7 +20,7 @@ tokio = { version = "1", features = ["full"] }
 anyhow = "1"
 reqwest = { version = "0.12", features = ["rustls-tls", "cookies", "gzip", "brotli", "deflate"] }
 url = "2"
-thiserror = "1"
+thiserror = "2"
 scraper = "0.20"
 html2text = "0.12"
 serde = { version = "1", features = ["derive"] }
