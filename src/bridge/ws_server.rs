@@ -8,7 +8,7 @@ use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::{Json, Router};
 use futures_util::{SinkExt, StreamExt};
-use rand::Rng;
+use rand::RngCore;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
@@ -24,9 +24,9 @@ struct ServerState {
 
 /// Generate a cryptographically random authentication token (32 random bytes, hex-encoded).
 pub fn generate_token() -> String {
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     let mut bytes = [0u8; 32];
-    rng.fill(&mut bytes);
+    rng.fill_bytes(&mut bytes);
     hex::encode(bytes)
 }
 
