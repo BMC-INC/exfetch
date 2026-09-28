@@ -16,7 +16,11 @@ use exfetch::search;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt::init();
+    // Logs must go to stderr: stdout carries JSON-RPC in `serve --mcp-stdio`.
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_ansi(false)
+        .init();
 
     let cli = Cli::parse();
 
