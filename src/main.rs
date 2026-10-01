@@ -240,6 +240,18 @@ async fn main() -> Result<()> {
             let policy = Arc::new(PolicyEngine::new());
 
             if args.mcp_stdio {
+                // The extension bridge must run in-process: browser tools resolve
+                // against this process's ConnectionManager. Best-effort, so a busy
+                // port range never takes the MCP server down with it.
+                let token = ws_server::generate_token();
+                match ws_server::start(args.port, token, connections.clone()).await {
+                    Ok(actual_port) => eprintln!(
+                        "[exfetch] WebSocket bridge listening on 127.0.0.1:{}",
+                        actual_port
+                    ),
+                    Err(e) => eprintln!("[exfetch] WebSocket bridge unavailable: {}", e),
+                }
+
                 // Run MCP server over stdin/stdout
                 mcp::server::run_stdio(connections, policy).await?;
             } else {
