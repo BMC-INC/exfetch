@@ -197,7 +197,9 @@ function waitForTabLoad(tabId, timeoutMs = 15000) {
 }
 
 function assertAllowedUrl(url, params = {}) {
-  const host = new URL(url).hostname.toLowerCase().replace(/\.+$/, "");
+  const parsed = new URL(url);
+  if (!["http:", "https:"].includes(parsed.protocol)) throw new Error("Browser actions support only HTTP and HTTPS pages");
+  const host = parsed.hostname.toLowerCase().replace(/\.+$/, "");
   const matches = (pattern) => {
     pattern = pattern.toLowerCase().replace(/\.+$/, "");
     return pattern.startsWith("*.")

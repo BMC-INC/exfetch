@@ -1,0 +1,91 @@
+name: Release
+on:
+  workflow_dispatch:
+  push:
+    tags: ['v*.*.*']
+permissions:
+  contents: read
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: aarch64-apple-darwin
+            os: macos-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Verify tag and extension versions
+        run: |
+          python3 - <<'PY'
+          import json,os,tomllib
+          v=tomllib.load(open('Cargo.toml','rb'))['package']['version']
+          ref=os.environ['GITHUB_REF']
+          assert not ref.startswith('refs/tags/') or ref == 'refs/tags/v'+v
+          for browser in ['chrome','safari/Shared']:
+              assert json.load(open(f'extension/{browser}/manifest.json'))['version'] == v
+          PY
+      - run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Package executable and license
+        run: |
+          mkdir dist
+          cp target/${{ matrix.target }}/release/exfetch README.md LICENSE dist/
+          tar czf exfetch-${{ matrix.target }}.tar.gz -C dist exfetch README.md LICENSE
+      - uses: actions/upload-artifact@v4
+        with:
+          name: exfetch-${{ matrix.target }}
+          path: exfetch-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+  extensions:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: node --test tests/extension_policy_tests.cjs
+      - name: Package unpacked Chrome extension source
+        run: |
+          mkdir dist
+          cp -R extension/chrome dist/chrome
+          cp README.md LICENSE dist/
+          cd dist
+          zip -r ../exfetch-chrome-extension.zip chrome README.md LICENSE
+      - uses: actions/upload-artifact@v4
+        with:
+          name: exfetch-chrome-extension
+          path: exfetch-chrome-extension.zip
+  release:
+    needs: [build, extensions]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Verify complete asset set and generate checksums
+        run: |
+          cd artifacts
+          test -f exfetch-x86_64-unknown-linux-gnu.tar.gz
+          test -f exfetch-x86_64-apple-darwin.tar.gz
+          test -f exfetch-aarch64-apple-darwin.tar.gz
+          test -f exfetch-chrome-extension.zip
+          sha256sum -- *.tar.gz *.zip > SHA256SUMS
+      - uses: softprops/action-gh-release@v2
+        with:
+          body_path: docs/releases/${{ github.ref_name }}.md
+          generate_release_notes: true
+          files: artifacts/*

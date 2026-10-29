@@ -26,6 +26,9 @@ for (const browser of ['chrome', 'safari/Shared']) {
       /blocked by policy/,
     );
     assert.throws(() => vm.runInContext('assertAllowedUrl("https://blocked.example./", { blocked_domains: ["blocked.example"] })', context), /blocked by policy/);
+    for (const url of ['file:///tmp/private.html', 'chrome://settings', 'data:text/html,private']) {
+      assert.throws(() => vm.runInContext(`assertAllowedUrl(${JSON.stringify(url)})`, context), /only HTTP and HTTPS/);
+    }
     assert.equal(queried, false, 'blocked target must be refused before opening/querying a tab');
     await assert.rejects(
       vm.runInContext('findOrCreateTab("https://allowed.example", { blocked_domains: ["blocked.example"] })', context),

@@ -19,7 +19,7 @@ exfetch brings HTTP fetching, text and Markdown extraction, PDF text extraction,
 | Connect an assistant | `exfetch serve --mcp-stdio` |
 | Use local browser actions | MCP `browser_action` |
 
-**Status:** version 0.1.0, a working local developer tool with automated Rust and extension-policy tests. Browser access requires an installed extension and a running bridge. It is not a hosted browser service or a public multi-user gateway.
+**Status:** version 0.2.0, a working local developer tool with automated Rust and extension-policy tests. Browser access requires an installed extension and a running bridge. It is not a hosted browser service or a public multi-user gateway.
 
 ## Quick start
 
@@ -116,7 +116,7 @@ Set `[tabs]` `reuse_strategy` to `exact` (default), `domain`, or `none`, and `op
 
 HTTP retrieval validates and pins each destination's resolved IP addresses, including redirects, and rejects private/reserved targets. This also applies to PDF downloads. Direct fetches bypass system proxy configuration so validation refers to the connection's actual destination.
 
-Browser retrieval uses the permissions, cookies, and network access of your browser. Treat the extension and connected assistant as trusted local software. Fetched content is untrusted input; an assistant should not treat instructions inside a page as authorization for further actions.
+Browser retrieval uses the permissions, cookies, and network access of your browser. The extension requests `<all_urls>` because Chrome requires that grant for assistant-triggered viewport screenshots without a separate toolbar click. Browser page actions still accept only HTTP/HTTPS targets; file, data and browser-internal pages are rejected. Treat the extension and connected assistant as trusted local software. Fetched content is untrusted input; an assistant should not treat instructions inside a page as authorization for further actions.
 
 The bridge binds to loopback, rejects unexpected Host/Origin headers, and uses a local token for browser connections and CLI bridge requests. The token is available to local clients for pairing, so it is not a boundary against other software running as your user. No claim of enterprise isolation, complete SSRF protection across browser actions, or production security certification is made.
 
@@ -129,7 +129,7 @@ node --test tests/extension_policy_tests.cjs
 cargo audit
 ```
 
-Rust tests cover extraction, PDF parsing, MCP dispatch, configuration, direct-request policy, and authenticated CLI-to-extension round trips. Some HTTP tests contact `httpbin.org` and require network access. Node tests validate Chrome/Safari shared policy behavior without a real browser. Real Chrome installation and Safari packaging require separate device validation. Screenshots capture the visible viewport; full-page requests return an explicit unsupported-operation error.
+Rust tests cover extraction, PDF parsing, MCP dispatch, configuration, direct-request policy, and authenticated CLI-to-extension round trips. Some HTTP tests contact `httpbin.org` and require network access. Node tests validate Chrome/Safari shared policy behavior. A separate real Chromium extension test exercises rendered pages, browser actions, screenshots and policy rejection in a disposable profile. See [release validation](docs/RELEASE_VALIDATION.md) for tested clients and upgrade notes. Signed Safari packaging still requires separate device validation. Screenshots capture the visible viewport; full-page requests return an explicit unsupported-operation error.
 
 | Directory | Responsibility |
 | --- | --- |
