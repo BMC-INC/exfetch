@@ -41,7 +41,7 @@ pub struct FetchArgs {
     pub json: bool,
 
     /// Force browser-based fetching
-    #[arg(short = 'b', long)]
+    #[arg(short = 'b', long, conflicts_with = "no_browser")]
     pub browser: bool,
 
     /// Disable browser-based fetching
@@ -53,16 +53,16 @@ pub struct FetchArgs {
     pub selector: Option<String>,
 
     /// Request timeout in seconds
-    #[arg(long, default_value_t = 15)]
-    pub timeout: u64,
+    #[arg(long)]
+    pub timeout: Option<u64>,
 
     /// Maximum content length (bytes)
     #[arg(long)]
     pub max_length: Option<usize>,
 
     /// User-Agent header
-    #[arg(long, default_value = "exfetch/0.1")]
-    pub user_agent: String,
+    #[arg(long)]
+    pub user_agent: Option<String>,
 
     /// Suppress non-essential output
     #[arg(short = 'q', long)]
@@ -87,8 +87,8 @@ pub struct SearchArgs {
     pub results: u32,
 
     /// Search engine to use
-    #[arg(long, default_value = "duckduckgo")]
-    pub engine: String,
+    #[arg(long, value_parser = ["duckduckgo", "searxng"])]
+    pub engine: Option<String>,
 
     /// SearXNG instance URL (used when engine is "searxng")
     #[arg(long)]
@@ -103,8 +103,8 @@ pub struct SearchArgs {
     pub markdown: bool,
 
     /// Request timeout in seconds
-    #[arg(long, default_value_t = 15)]
-    pub timeout: u64,
+    #[arg(long)]
+    pub timeout: Option<u64>,
 
     /// Suppress non-essential output
     #[arg(short = 'q', long)]

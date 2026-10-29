@@ -33,7 +33,7 @@ fn test_tool_definitions_valid() {
         assert!(
             tool.input_schema
                 .get("properties")
-                .map_or(false, |v| v.is_object()),
+                .is_some_and(|v| v.is_object()),
             "tool '{}' inputSchema must have a properties object",
             tool.name
         );

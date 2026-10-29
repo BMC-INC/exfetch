@@ -14,15 +14,20 @@ pub fn format_raw(body: &str, max_length: Option<usize>) -> String {
         _ => return body.to_string(),
     };
 
-    // Find the last space at or before `max` to avoid splitting a word.
-    let cut = match body[..max].rfind(' ') {
+    // Byte limits may fall inside a multi-byte UTF-8 character.
+    let mut boundary = max;
+    while !body.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    // Find the last space at or before the valid boundary.
+    let cut = match body[..boundary].rfind(' ') {
         Some(pos) => pos,
-        None => max, // no space found — cut at the hard limit
+        None => boundary,
     };
 
     let truncated = &body[..cut];
     format!(
-        "{}\n[truncated at {} chars, full content {} chars]",
+        "{}\n[truncated at {} bytes, full content {} bytes]",
         truncated,
         cut,
         body.len()
@@ -32,6 +37,16 @@ pub fn format_raw(body: &str, max_length: Option<usize>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn truncation_respects_utf8_boundaries() {
+        for limit in 0.."你好🌍".len() {
+            let output = format_raw("你好🌍", Some(limit));
+            let prefix = output.split('\n').next().unwrap();
+            assert!(prefix.len() <= limit);
+            assert!("你好🌍".starts_with(prefix));
+        }
+    }
 
     #[test]
     fn no_truncation_when_under_limit() {

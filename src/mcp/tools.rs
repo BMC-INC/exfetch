@@ -22,12 +22,12 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
                     },
                     "use_browser": {
                         "type": "boolean",
-                        "default": true,
-                        "description": "Whether to use browser-based fetching if available"
+                        "default": false,
+                        "description": "Require a connected browser extension for fetching"
                     },
                     "max_length": {
                         "type": "integer",
-                        "description": "Maximum content length in characters"
+                        "description": "Maximum extracted content length in bytes (UTF-8 safe truncation)"
                     },
                     "selector": {
                         "type": "string",
@@ -66,7 +66,7 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
                         "type": "string",
                         "enum": ["text", "markdown", "html", "json"],
                         "default": "markdown",
-                        "description": "Output format for fetched content"
+                        "description": "Output format for search results and extracted content"
                     }
                 },
                 "required": ["query"]

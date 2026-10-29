@@ -24,8 +24,10 @@ pub struct PolicyEngine {
     pub allowed_actions: HashSet<String>,
     /// Whether cookie reading is allowed.
     pub allow_cookie_read: bool,
+    pub cookie_allowed_domains: Vec<String>,
     /// Maximum requests per minute (rate limiting).
     pub max_requests_per_minute: u32,
+    pub log_all: bool,
     request_count: AtomicU32,
     last_reset: Mutex<Instant>,
 }
@@ -56,9 +58,31 @@ impl PolicyEngine {
             blocked_domains: Vec::new(),
             allowed_actions,
             allow_cookie_read: false,
+            cookie_allowed_domains: Vec::new(),
             max_requests_per_minute: 60,
+            log_all: true,
             request_count: AtomicU32::new(0),
             last_reset: Mutex::new(Instant::now()),
+        }
+    }
+
+    pub fn from_config(config: &crate::config::PolicyConfig) -> Self {
+        Self {
+            blocked_domains: config
+                .blocked_domains
+                .iter()
+                .map(|domain| domain.to_lowercase())
+                .collect(),
+            allowed_actions: config.allowed_actions.iter().cloned().collect(),
+            allow_cookie_read: config.allow_cookie_read,
+            cookie_allowed_domains: config
+                .cookie_allowed_domains
+                .iter()
+                .map(|domain| domain.to_lowercase())
+                .collect(),
+            max_requests_per_minute: config.max_requests_per_minute,
+            log_all: config.log_all,
+            ..Self::new()
         }
     }
 
@@ -108,6 +132,30 @@ impl PolicyEngine {
         }
     }
 
+    pub fn check_cookie_url(&self, url: &str) -> PolicyVerdict {
+        if !self.allow_cookie_read {
+            return PolicyVerdict::Block("cookie reading is disabled by policy".into());
+        }
+        let Some(domain) = extract_domain(url) else {
+            return PolicyVerdict::Block("cookie reading requires an explicit URL".into());
+        };
+        if !self
+            .cookie_allowed_domains
+            .iter()
+            .any(|pattern| domain_matches(&domain, pattern))
+        {
+            return PolicyVerdict::Block(format!(
+                "cookie domain {} is not in cookie_allowed_domains",
+                domain
+            ));
+        }
+        self.check_domain(url)
+    }
+
+    pub fn has_domain_restrictions(&self) -> bool {
+        !self.blocked_domains.is_empty() || self.allowed_domains.is_some()
+    }
+
     /// Check whether the rate limit has been exceeded.
     pub fn check_rate_limit(&self) -> PolicyVerdict {
         self.maybe_reset_counter();
@@ -125,7 +173,10 @@ impl PolicyEngine {
     /// Record a request (increments the rate limiter counter).
     pub fn record_request(&self) {
         self.maybe_reset_counter();
-        self.request_count.fetch_add(1, Ordering::Relaxed);
+        let count = self.request_count.fetch_add(1, Ordering::Relaxed) + 1;
+        if self.log_all {
+            tracing::info!(request_count = count, "request accepted under local policy");
+        }
     }
 
     fn maybe_reset_counter(&self) {
@@ -154,11 +205,13 @@ fn extract_domain(url: &str) -> Option<String> {
 
     url::Url::parse(&normalized)
         .ok()
-        .and_then(|u| u.host_str().map(|h| h.to_lowercase()))
+        .and_then(|u| u.host_str().map(|h| h.trim_end_matches('.').to_lowercase()))
 }
 
 /// Check if a domain matches a pattern. Supports wildcard prefix "*.".
 fn domain_matches(domain: &str, pattern: &str) -> bool {
+    let domain = domain.trim_end_matches('.').to_lowercase();
+    let pattern = pattern.trim_end_matches('.').to_lowercase();
     if let Some(suffix) = pattern.strip_prefix("*.") {
         // Wildcard: matches the suffix itself and any subdomain
         domain == suffix || domain.ends_with(&format!(".{}", suffix))
@@ -170,6 +223,46 @@ fn domain_matches(domain: &str, pattern: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cookie_configuration_requires_a_matching_allowlist() {
+        let mut config = crate::config::PolicyConfig {
+            allow_cookie_read: true,
+            cookie_allowed_domains: vec!["*.example.com".into()],
+            ..Default::default()
+        };
+        let policy = PolicyEngine::from_config(&config);
+        assert_eq!(
+            policy.check_cookie_url("https://sub.example.com"),
+            PolicyVerdict::Allow
+        );
+        assert!(matches!(
+            policy.check_cookie_url("https://other.example"),
+            PolicyVerdict::Block(_)
+        ));
+        config.cookie_allowed_domains.clear();
+        assert!(matches!(
+            PolicyEngine::from_config(&config).check_cookie_url("https://example.com"),
+            PolicyVerdict::Block(_)
+        ));
+    }
+
+    #[test]
+    fn terminal_dns_dots_do_not_bypass_domain_policy() {
+        let mut policy = PolicyEngine::new();
+        policy.blocked_domains = vec!["blocked.example".into()];
+        assert!(matches!(
+            policy.check_domain("https://blocked.example./"),
+            PolicyVerdict::Block(_)
+        ));
+        assert!(domain_matches("sub.example.com.", "*.EXAMPLE.COM."));
+        policy.allow_cookie_read = true;
+        policy.cookie_allowed_domains = vec!["allowed.example.".into()];
+        assert_eq!(
+            policy.check_cookie_url("https://allowed.example/"),
+            PolicyVerdict::Allow
+        );
+    }
 
     #[test]
     fn test_wildcard_domain_matching() {

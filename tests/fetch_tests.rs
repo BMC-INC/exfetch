@@ -146,10 +146,8 @@ fn test_pdf_extraction() {
         "Count" => 1,
     });
 
-    if let Ok(page) = doc.get_object_mut(page_id) {
-        if let Object::Dictionary(ref mut dict) = page {
-            dict.set("Parent", pages_id);
-        }
+    if let Ok(Object::Dictionary(ref mut dict)) = doc.get_object_mut(page_id) {
+        dict.set("Parent", pages_id);
     }
 
     let catalog_id = doc.add_object(dictionary! {
@@ -179,5 +177,34 @@ fn test_pdf_invalid_bytes() {
     match result.unwrap_err() {
         PdfError::ParseError(_) => {} // expected
         other => panic!("expected ParseError, got: {:?}", other),
+    }
+}
+
+#[tokio::test]
+async fn test_pdf_fetch_also_blocks_private_addresses() {
+    let result = exfetch::fetch::http::fetch_bytes(
+        "http://127.0.0.1/document.pdf",
+        Duration::from_secs(1),
+        "exfetch-test",
+    )
+    .await;
+    assert!(matches!(result, Err(FetchError::SsrfBlocked { .. })));
+}
+
+#[test]
+fn test_reserved_and_mapped_addresses_are_not_public_targets() {
+    for address in [
+        "100.64.0.1",
+        "224.0.0.1",
+        "240.0.0.1",
+        "0.1.2.3",
+        "::ffff:127.0.0.1",
+        "ff02::1",
+    ] {
+        assert!(
+            exfetch::fetch::http::is_private_ip(&address.parse().unwrap()),
+            "{}",
+            address
+        );
     }
 }
