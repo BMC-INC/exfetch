@@ -98,7 +98,7 @@ fn test_truncation_at_word_boundary() {
         first_line
     );
     assert!(
-        out.contains(&format!("full content {} chars", input.len())),
+        out.contains(&format!("full content {} bytes", input.len())),
         "should report full content length, got: {}",
         out
     );

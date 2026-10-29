@@ -1,11 +1,15 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use crate::engine::policy::{PolicyEngine, PolicyVerdict};
 use anyhow::Result;
 use axum::extract::ws::{Message as AxumMessage, WebSocket};
+use axum::extract::Request;
 use axum::extract::{State, WebSocketUpgrade};
+use axum::http::{HeaderMap, StatusCode};
+use axum::middleware::{self, Next};
 use axum::response::IntoResponse;
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures_util::{SinkExt, StreamExt};
 use rand::RngCore;
@@ -20,6 +24,7 @@ use super::protocol::{BridgeMessage, MessageType};
 struct ServerState {
     token: String,
     connections: ConnectionManager,
+    policy: Arc<PolicyEngine>,
 }
 
 /// Generate a cryptographically random authentication token (32 random bytes, hex-encoded).
@@ -38,21 +43,35 @@ pub fn generate_token() -> String {
 /// Writes the actual port to `~/.config/exfetch/port`.
 /// Returns the actual port the server bound to.
 pub async fn start(port: u16, token: String, connections: ConnectionManager) -> Result<u16> {
+    start_with_policy(port, token, connections, Arc::new(PolicyEngine::new())).await
+}
+
+pub async fn start_with_policy(
+    port: u16,
+    token: String,
+    connections: ConnectionManager,
+    policy: Arc<PolicyEngine>,
+) -> Result<u16> {
     let state = Arc::new(ServerState {
         token: token.clone(),
         connections: connections.clone(),
+        policy,
     });
 
     let app = Router::new()
         .route("/health", get(health_handler))
         .route("/token", get(token_handler))
+        .route("/fetch", post(fetch_handler))
         .route("/ws", get(ws_handler))
         .fallback(get(ws_handler))
-        .with_state(state);
+        .with_state(state)
+        .layer(middleware::from_fn(require_loopback_host));
 
     let listener = bind_with_fallback(port).await?;
     let actual_port = listener.local_addr()?.port();
-    write_port_file(actual_port)?;
+    if port != 0 {
+        write_port_file(actual_port)?;
+    }
 
     tokio::spawn(async move {
         if let Err(e) = axum::serve(listener, app).await {
@@ -63,8 +82,161 @@ pub async fn start(port: u16, token: String, connections: ConnectionManager) -> 
     Ok(actual_port)
 }
 
+/// Reject unexpected hosts to prevent DNS rebinding into the local bridge.
+pub async fn require_loopback_host(
+    request: Request,
+    next: Next,
+) -> Result<axum::response::Response, StatusCode> {
+    let host = request
+        .headers()
+        .get("host")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+    let hostname = host.split(':').next().unwrap_or("");
+    if hostname != "127.0.0.1" && hostname != "localhost" {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    if let Some(origin) = request
+        .headers()
+        .get("origin")
+        .and_then(|value| value.to_str().ok())
+    {
+        if !origin.starts_with("chrome-extension://")
+            && !origin.starts_with("safari-web-extension://")
+        {
+            return Err(StatusCode::FORBIDDEN);
+        }
+    }
+    Ok(next.run(request).await)
+}
+
+async fn fetch_handler(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+    Json(mut params): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let expected = format!("Bearer {}", state.token);
+    if headers
+        .get("authorization")
+        .and_then(|value| value.to_str().ok())
+        != Some(expected.as_str())
+    {
+        return Err((StatusCode::UNAUTHORIZED, "Invalid bridge token".into()));
+    }
+    let url = params
+        .get("url")
+        .and_then(|value| value.as_str())
+        .ok_or((StatusCode::BAD_REQUEST, "Missing URL".to_string()))?;
+    if let PolicyVerdict::Block(reason) = state.policy.check_domain(url) {
+        return Err((StatusCode::FORBIDDEN, reason));
+    }
+    if let PolicyVerdict::Block(reason) = state.policy.check_rate_limit() {
+        return Err((StatusCode::TOO_MANY_REQUESTS, reason));
+    }
+    state.policy.record_request();
+    let settings = crate::config::load()
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    params["reuse_strategy"] = serde_json::json!(settings.tabs.reuse_strategy);
+    params["open_in_background"] = serde_json::json!(settings.tabs.open_in_background);
+    params["blocked_domains"] = serde_json::json!(state.policy.blocked_domains);
+    params["allowed_domains"] = serde_json::json!(state.policy.allowed_domains);
+    let result = state
+        .connections
+        .send_command("fetch_page", params)
+        .await
+        .map_err(|error| (StatusCode::BAD_GATEWAY, error.to_string()))?;
+    if let Some(final_url) = result.get("url").and_then(|value| value.as_str()) {
+        if let PolicyVerdict::Block(reason) = state.policy.check_domain(final_url) {
+            return Err((StatusCode::FORBIDDEN, reason));
+        }
+    }
+    Ok(Json(result))
+}
+
+/// Fetch rendered HTML through the running local bridge and its extension.
+pub async fn fetch_from_running_bridge(
+    url: &str,
+    timeout: std::time::Duration,
+) -> Result<crate::fetch::http::FetchResponse> {
+    let port_path = crate::config::config_dir().join("port");
+    let port: u16 = std::fs::read_to_string(&port_path)
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "Start `exfetch serve` and connect the browser extension before using --browser"
+            )
+        })?
+        .trim()
+        .parse()?;
+    fetch_from_bridge_port(port, url, timeout).await
+}
+
+pub async fn fetch_from_bridge_port(
+    port: u16,
+    url: &str,
+    timeout: std::time::Duration,
+) -> Result<crate::fetch::http::FetchResponse> {
+    let start = std::time::Instant::now();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(timeout)
+        .build()?;
+    let base = format!("http://127.0.0.1:{}", port);
+    let token: serde_json::Value = serde_json::from_str(
+        &client
+            .get(format!("{}/token", base))
+            .send()
+            .await?
+            .error_for_status()?
+            .text()
+            .await?,
+    )?;
+    let token = token
+        .get("token")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| anyhow::anyhow!("Invalid bridge token response"))?;
+    let response = client
+        .post(format!("{}/fetch", base))
+        .bearer_auth(token)
+        .header("content-type", "application/json")
+        .body(serde_json::json!({"url": url}).to_string())
+        .send()
+        .await?;
+    if !response.status().is_success() {
+        anyhow::bail!("Browser bridge: {}", response.text().await?);
+    }
+    let result: serde_json::Value = serde_json::from_str(&response.text().await?)?;
+    if result.get("success").and_then(|value| value.as_bool()) == Some(false) {
+        anyhow::bail!(
+            "Browser fetch: {}",
+            result
+                .get("error")
+                .and_then(|value| value.as_str())
+                .unwrap_or("unknown error")
+        );
+    }
+    let body = result
+        .get("html")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| anyhow::anyhow!("Browser returned no HTML"))?
+        .to_string();
+    Ok(crate::fetch::http::FetchResponse {
+        body,
+        status: 200,
+        content_type: "text/html".into(),
+        headers: Vec::new(),
+        final_url: result
+            .get("url")
+            .and_then(|value| value.as_str())
+            .unwrap_or(url)
+            .to_string(),
+        fetch_time_ms: start.elapsed().as_millis() as u64,
+    })
+}
+
 async fn health_handler() -> impl IntoResponse {
-    Json(serde_json::json!({"status": "ok", "service": "exfetch", "version": env!("CARGO_PKG_VERSION")}))
+    Json(
+        serde_json::json!({"status": "ok", "service": "exfetch", "version": env!("CARGO_PKG_VERSION")}),
+    )
 }
 
 async fn token_handler(State(state): State<Arc<ServerState>>) -> impl IntoResponse {
@@ -123,7 +295,9 @@ async fn handle_ws_connection(socket: WebSocket, state: Arc<ServerState>) {
                 "status": "error",
                 "reason": "auth timeout or invalid message"
             });
-            let _ = ws_sender.send(AxumMessage::Text(reject.to_string().into())).await;
+            let _ = ws_sender
+                .send(AxumMessage::Text(reject.to_string().into()))
+                .await;
             let _ = ws_sender.close().await;
             return;
         }
@@ -139,7 +313,9 @@ async fn handle_ws_connection(socket: WebSocket, state: Arc<ServerState>) {
             "status": "rejected",
             "reason": "invalid token"
         });
-        let _ = ws_sender.send(AxumMessage::Text(reject.to_string().into())).await;
+        let _ = ws_sender
+            .send(AxumMessage::Text(reject.to_string().into()))
+            .await;
         let _ = ws_sender.close().await;
         return;
     }
@@ -173,7 +349,9 @@ async fn handle_ws_connection(socket: WebSocket, state: Arc<ServerState>) {
         "status": "authenticated",
         "connection_id": conn_id,
     });
-    let _ = ws_sender.send(AxumMessage::Text(ack.to_string().into())).await;
+    let _ = ws_sender
+        .send(AxumMessage::Text(ack.to_string().into()))
+        .await;
 
     eprintln!("[exfetch] extension connected: {} ({})", browser, conn_id);
 

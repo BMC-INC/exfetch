@@ -1,6 +1,7 @@
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, Instant};
 
+use crate::engine::policy::{PolicyEngine, PolicyVerdict};
 use reqwest::redirect::Policy;
 use thiserror::Error;
 use url::Url;
@@ -37,6 +38,9 @@ pub enum FetchError {
     #[error("invalid URL: {0}")]
     InvalidUrl(String),
 
+    #[error("request blocked by policy: {0}")]
+    PolicyBlocked(String),
+
     #[error("SSRF blocked: request to private/reserved IP {ip}")]
     SsrfBlocked { ip: String },
 }
@@ -50,11 +54,19 @@ pub fn is_private_ip(ip: &IpAddr) -> bool {
             v4.is_loopback()                          // 127.0.0.0/8
                 || v4.is_private()                     // 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16
                 || v4.is_link_local()                  // 169.254.0.0/16
-                || v4.octets() == [0, 0, 0, 0]        // 0.0.0.0
-                || v4.is_broadcast() // 255.255.255.255
+                || v4.octets()[0] == 0
+                || v4.is_multicast()
+                || v4.is_documentation()
+                || v4.octets()[0] >= 240
+                || (v4.octets()[0] == 100 && (64..=127).contains(&v4.octets()[1]))
+                || (v4.octets()[0] == 198 && (18..=19).contains(&v4.octets()[1]))
+                || v4.is_broadcast()
         }
         IpAddr::V6(v6) => {
-            v6.is_loopback()                           // ::1
+            v6.to_ipv4_mapped().map(|ip| is_private_ip(&IpAddr::V4(ip))).unwrap_or(false)
+                || v6.is_multicast()
+                || (v6.segments()[0] == 0x2001 && v6.segments()[1] == 0x0db8)
+                || v6.is_loopback()                           // ::1
                 || {
                     // Link-local fe80::/10
                     let segs = v6.segments();
@@ -73,32 +85,108 @@ pub fn is_private_ip(ip: &IpAddr) -> bool {
 /// Resolve the hostname of a URL and check that all resolved IPs are
 /// non-private. Returns `Err(FetchError::SsrfBlocked)` if any resolved
 /// address is in a private/reserved range.
-async fn check_ssrf(url: &Url, allow_private: bool) -> Result<(), FetchError> {
-    if allow_private {
-        return Ok(());
-    }
-
-    let host = match url.host_str() {
-        Some(h) => h,
-        None => return Err(FetchError::InvalidUrl("no host in URL".to_string())),
+async fn resolve_target(url: &Url, allow_private: bool) -> Result<Vec<SocketAddr>, FetchError> {
+    let host = url
+        .host_str()
+        .ok_or_else(|| FetchError::InvalidUrl("no host in URL".into()))?;
+    let port = url
+        .port_or_known_default()
+        .ok_or_else(|| FetchError::InvalidUrl("HTTP(S) URL required".into()))?;
+    let addresses: Vec<SocketAddr> = match url.host() {
+        Some(url::Host::Ipv4(ip)) => vec![SocketAddr::new(IpAddr::V4(ip), port)],
+        Some(url::Host::Ipv6(ip)) => vec![SocketAddr::new(IpAddr::V6(ip), port)],
+        _ => tokio::net::lookup_host((host, port))
+            .await
+            .map_err(|error| {
+                FetchError::Network(format!("DNS lookup failed for {}: {}", host, error))
+            })?
+            .collect(),
     };
-
-    let port = url.port_or_known_default().unwrap_or(443);
-    let addr_str = format!("{}:{}", host, port);
-
-    let addrs = tokio::net::lookup_host(&addr_str)
-        .await
-        .map_err(|e| FetchError::Network(format!("DNS lookup failed for {}: {}", host, e)))?;
-
-    for addr in addrs {
-        if is_private_ip(&addr.ip()) {
-            return Err(FetchError::SsrfBlocked {
-                ip: addr.ip().to_string(),
-            });
+    if addresses.is_empty() {
+        return Err(FetchError::Network("DNS returned no addresses".into()));
+    }
+    if !allow_private {
+        for address in &addresses {
+            if is_private_ip(&address.ip()) {
+                return Err(FetchError::SsrfBlocked {
+                    ip: address.ip().to_string(),
+                });
+            }
         }
     }
+    Ok(addresses)
+}
 
-    Ok(())
+/// Validate and pin each redirect destination rather than resolving once and
+/// letting the HTTP client perform unchecked DNS lookups or redirects later.
+async fn request_url(
+    mut url: Url,
+    timeout: Duration,
+    user_agent: &str,
+    allow_private: bool,
+    policy: Option<&PolicyEngine>,
+) -> Result<reqwest::Response, FetchError> {
+    let started = Instant::now();
+    for hop in 0..=10 {
+        if let Some(policy) = policy {
+            if let PolicyVerdict::Block(reason) = policy.check_domain(url.as_str()) {
+                return Err(FetchError::PolicyBlocked(reason));
+            }
+        }
+        if !matches!(url.scheme(), "http" | "https") {
+            return Err(FetchError::InvalidUrl(
+                "only HTTP and HTTPS are supported".into(),
+            ));
+        }
+        let addresses = tokio::time::timeout(
+            timeout.saturating_sub(started.elapsed()),
+            resolve_target(&url, allow_private),
+        )
+        .await
+        .map_err(|_| FetchError::Timeout {
+            timeout_secs: timeout.as_secs(),
+        })??;
+        let remaining = timeout
+            .checked_sub(started.elapsed())
+            .ok_or(FetchError::Timeout {
+                timeout_secs: timeout.as_secs(),
+            })?;
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(remaining)
+            .redirect(Policy::none())
+            .user_agent(user_agent)
+            .resolve_to_addrs(url.host_str().unwrap(), &addresses)
+            .build()
+            .map_err(|error| FetchError::Network(error.to_string()))?;
+        let response = client.get(url.clone()).send().await.map_err(|error| {
+            if error.is_timeout() {
+                FetchError::Timeout {
+                    timeout_secs: timeout.as_secs(),
+                }
+            } else {
+                FetchError::Network(error.to_string())
+            }
+        })?;
+        if matches!(response.status().as_u16(), 301 | 302 | 303 | 307 | 308) {
+            if hop == 10 {
+                return Err(FetchError::TooManyRedirects);
+            }
+            let destination = response
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|value| value.to_str().ok())
+                .ok_or_else(|| {
+                    FetchError::Network("redirect has no valid Location header".into())
+                })?;
+            url = url
+                .join(destination)
+                .map_err(|error| FetchError::InvalidUrl(error.to_string()))?;
+            continue;
+        }
+        return Ok(response);
+    }
+    Err(FetchError::TooManyRedirects)
 }
 
 /// Normalize a raw URL string into a proper `Url`.
@@ -149,31 +237,28 @@ pub async fn fetch_url_with_options(
     user_agent: &str,
     allow_private: bool,
 ) -> Result<FetchResponse, FetchError> {
+    fetch_url_internal(raw_url, timeout, user_agent, allow_private, None).await
+}
+
+pub async fn fetch_url_with_policy(
+    raw_url: &str,
+    timeout: Duration,
+    user_agent: &str,
+    policy: &PolicyEngine,
+) -> Result<FetchResponse, FetchError> {
+    fetch_url_internal(raw_url, timeout, user_agent, false, Some(policy)).await
+}
+
+async fn fetch_url_internal(
+    raw_url: &str,
+    timeout: Duration,
+    user_agent: &str,
+    allow_private: bool,
+    policy: Option<&PolicyEngine>,
+) -> Result<FetchResponse, FetchError> {
     let url = normalize_url(raw_url)?;
-
-    // SSRF check: resolve hostname and reject private IPs
-    check_ssrf(&url, allow_private).await?;
-
-    let client = reqwest::Client::builder()
-        .timeout(timeout)
-        .redirect(Policy::limited(10))
-        .user_agent(user_agent)
-        .build()
-        .map_err(|e| FetchError::Network(e.to_string()))?;
-
     let start = Instant::now();
-
-    let response = client.get(url.as_str()).send().await.map_err(|e| {
-        if e.is_timeout() {
-            FetchError::Timeout {
-                timeout_secs: timeout.as_secs(),
-            }
-        } else if e.is_redirect() {
-            FetchError::TooManyRedirects
-        } else {
-            FetchError::Network(e.to_string())
-        }
-    })?;
+    let response = request_url(url, timeout, user_agent, allow_private, policy).await?;
 
     let status = response.status().as_u16();
     let final_url = response.url().to_string();
@@ -245,28 +330,27 @@ pub async fn fetch_bytes(
     timeout: Duration,
     user_agent: &str,
 ) -> Result<BytesResponse, FetchError> {
+    fetch_bytes_internal(raw_url, timeout, user_agent, None).await
+}
+
+pub async fn fetch_bytes_with_policy(
+    raw_url: &str,
+    timeout: Duration,
+    user_agent: &str,
+    policy: &PolicyEngine,
+) -> Result<BytesResponse, FetchError> {
+    fetch_bytes_internal(raw_url, timeout, user_agent, Some(policy)).await
+}
+
+async fn fetch_bytes_internal(
+    raw_url: &str,
+    timeout: Duration,
+    user_agent: &str,
+    policy: Option<&PolicyEngine>,
+) -> Result<BytesResponse, FetchError> {
     let url = normalize_url(raw_url)?;
-
-    let client = reqwest::Client::builder()
-        .timeout(timeout)
-        .redirect(Policy::limited(10))
-        .user_agent(user_agent)
-        .build()
-        .map_err(|e| FetchError::Network(e.to_string()))?;
-
     let start = Instant::now();
-
-    let response = client.get(url.as_str()).send().await.map_err(|e| {
-        if e.is_timeout() {
-            FetchError::Timeout {
-                timeout_secs: timeout.as_secs(),
-            }
-        } else if e.is_redirect() {
-            FetchError::TooManyRedirects
-        } else {
-            FetchError::Network(e.to_string())
-        }
-    })?;
+    let response = request_url(url, timeout, user_agent, false, policy).await?;
 
     let status = response.status().as_u16();
     let final_url = response.url().to_string();
@@ -312,6 +396,32 @@ pub async fn fetch_bytes(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn redirect_destination_is_checked_against_domain_policy() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 2048];
+            let count = socket.read(&mut request).await.unwrap();
+            assert!(count > 0);
+            socket.write_all(format!("HTTP/1.1 302 Found\r\nLocation: http://localhost:{}/private\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", port).as_bytes()).await.unwrap();
+        });
+        let mut policy = PolicyEngine::new();
+        policy.blocked_domains.push("localhost".into());
+        let result = request_url(
+            Url::parse(&format!("http://127.0.0.1:{}", port)).unwrap(),
+            Duration::from_secs(2),
+            "test",
+            true,
+            Some(&policy),
+        )
+        .await;
+        assert!(matches!(result, Err(FetchError::PolicyBlocked(_))));
+        server.await.unwrap();
+    }
 
     #[test]
     fn test_normalize_url_with_scheme() {

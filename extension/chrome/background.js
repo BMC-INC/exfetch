@@ -186,22 +186,50 @@ function waitForTabLoad(tabId, timeoutMs = 15000) {
       }
     }
     chrome.tabs.onUpdated.addListener(listener);
+    chrome.tabs.get(tabId).then((tab) => {
+      if (tab.status === "complete") listener(tabId, { status: "complete" });
+    }).catch((error) => {
+      clearTimeout(timer);
+      chrome.tabs.onUpdated.removeListener(listener);
+      reject(error);
+    });
   });
 }
 
-async function findOrCreateTab(url) {
+function assertAllowedUrl(url, params = {}) {
+  const host = new URL(url).hostname.toLowerCase().replace(/\.+$/, "");
+  const matches = (pattern) => {
+    pattern = pattern.toLowerCase().replace(/\.+$/, "");
+    return pattern.startsWith("*.")
+      ? host === pattern.slice(2) || host.endsWith(pattern.slice(1))
+      : host === pattern;
+  };
+  if ((params.blocked_domains || []).some(matches)) throw new Error("Page domain is blocked by policy");
+  if (Array.isArray(params.allowed_domains) && !params.allowed_domains.some(matches)) {
+    throw new Error("Page domain is outside the domain allowlist");
+  }
+}
+
+async function findOrCreateTab(url, params = {}) {
   if (!url) {
     // Return the active tab
     const [active] = await chrome.tabs.query({ active: true, currentWindow: true });
+    if (active?.url) assertAllowedUrl(active.url, params);
     return active || null;
   }
 
+  assertAllowedUrl(url, params);
   // Exact URL match
-  const exactTabs = await chrome.tabs.query({ url });
-  if (exactTabs.length > 0) return exactTabs[0];
+  const reuse = params.reuse_strategy || "exact";
+  if (!["exact", "domain", "none"].includes(reuse)) throw new Error("Unknown tab reuse strategy");
+  if (reuse !== "none") {
+    const exactTabs = await chrome.tabs.query({ url });
+    if (exactTabs.length > 0) return exactTabs[0];
+  }
 
   // Same-origin match
   try {
+    if (reuse !== "domain") throw new Error("Domain reuse disabled");
     const parsed = new URL(url);
     const originPattern = `${parsed.origin}/*`;
     const originTabs = await chrome.tabs.query({ url: originPattern });
@@ -211,9 +239,11 @@ async function findOrCreateTab(url) {
   }
 
   // Fallback: create new tab
-  const tab = await chrome.tabs.create({ url, active: false });
+  const tab = await chrome.tabs.create({ url, active: params.open_in_background === false });
   await waitForTabLoad(tab.id);
-  return tab;
+  const loaded = await chrome.tabs.get(tab.id);
+  assertAllowedUrl(loaded.url, params);
+  return loaded;
 }
 
 // ---------------------------------------------------------------------------
@@ -269,11 +299,13 @@ async function handleCommand(msg) {
 // ---------------------------------------------------------------------------
 
 async function cmdFetchPage(params) {
-  const tab = await findOrCreateTab(params.url);
+  const tab = await findOrCreateTab(params.url, params);
   if (tab.url !== params.url) {
     await chrome.tabs.update(tab.id, { url: params.url });
     await waitForTabLoad(tab.id);
   }
+  const current = await chrome.tabs.get(tab.id);
+  assertAllowedUrl(current.url, params);
 
   const results = await chrome.scripting.executeScript({
     target: { tabId: tab.id },
@@ -289,7 +321,7 @@ async function cmdFetchPage(params) {
 }
 
 async function cmdReadDom(params) {
-  const tab = await findOrCreateTab(params.url);
+  const tab = await findOrCreateTab(params.url, params);
   const selector = params.selector || "body";
 
   const results = await chrome.scripting.executeScript({
@@ -312,7 +344,7 @@ async function cmdReadDom(params) {
 }
 
 async function cmdClick(params) {
-  const tab = await findOrCreateTab(params.url);
+  const tab = await findOrCreateTab(params.url, params);
   const selector = params.selector;
   if (!selector) throw new Error("selector is required for click");
 
@@ -333,7 +365,7 @@ async function cmdClick(params) {
 }
 
 async function cmdTypeText(params) {
-  const tab = await findOrCreateTab(params.url);
+  const tab = await findOrCreateTab(params.url, params);
   const selector = params.selector;
   const text = params.text;
   if (!selector) throw new Error("selector is required for type_text");
@@ -362,7 +394,7 @@ async function cmdNavigate(params) {
   const url = params.url;
   if (!url) throw new Error("url is required for navigate");
 
-  const tab = await findOrCreateTab(url);
+  const tab = await findOrCreateTab(url, params);
   if (tab.url !== url) {
     await chrome.tabs.update(tab.id, { url });
     await waitForTabLoad(tab.id);
@@ -372,13 +404,18 @@ async function cmdNavigate(params) {
 }
 
 async function cmdScreenshot(params) {
-  const tab = await findOrCreateTab(params.url);
+  const tab = await findOrCreateTab(params.url, params);
   // Bring tab to front for captureVisibleTab
   await chrome.tabs.update(tab.id, { active: true });
   // Small delay to let the tab render
   await new Promise((r) => setTimeout(r, 200));
 
-  const dataUrl = await chrome.tabs.captureVisibleTab(null, { format: "png" });
+  const current = await chrome.tabs.get(tab.id);
+  assertAllowedUrl(current.url, params);
+  if (!current.active || !Number.isInteger(current.windowId)) {
+    throw new Error("Screenshot target is no longer the active tab in its window");
+  }
+  const dataUrl = await chrome.tabs.captureVisibleTab(current.windowId, { format: "png" });
   // dataUrl is "data:image/png;base64,..."
   const base64 = dataUrl.split(",")[1] || dataUrl;
   return { screenshot: base64, format: "png", tab_id: tab.id };
@@ -433,7 +470,7 @@ async function cmdExecuteJs(params) {
   // through the authenticated WebSocket channel from the exfetch CLI binary.
   // The CLI's PolicyEngine gates whether execute_js is allowed at all.
   // The extension trusts authenticated binary commands by design.
-  const tab = await findOrCreateTab(params.url);
+  const tab = await findOrCreateTab(params.url, params);
   const code = params.code;
   if (!code) throw new Error("code is required for execute_js");
 

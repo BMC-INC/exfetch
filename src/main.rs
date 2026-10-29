@@ -8,7 +8,7 @@ use exfetch::bridge::ws_server;
 use exfetch::cli::commands::{Cli, Commands};
 use exfetch::config;
 use exfetch::engine::policy::PolicyEngine;
-use exfetch::fetch::http::{fetch_bytes, fetch_url};
+use exfetch::fetch::http::{fetch_bytes_with_policy, fetch_url_with_policy};
 use exfetch::fetch::pdf;
 use exfetch::mcp;
 use exfetch::output;
@@ -23,17 +23,46 @@ async fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
+    let config = config::load()?;
 
     match cli.command {
         Commands::Fetch(args) => {
-            let timeout = Duration::from_secs(args.timeout);
+            let timeout = Duration::from_secs(args.timeout.unwrap_or(config.defaults.timeout));
+            let user_agent = args
+                .user_agent
+                .as_deref()
+                .unwrap_or(&config.defaults.user_agent);
+            let policy = PolicyEngine::from_config(&config.policy);
+            if let exfetch::engine::policy::PolicyVerdict::Block(reason) =
+                policy.check_domain(&args.url)
+            {
+                anyhow::bail!(reason);
+            }
+            if args.browser {
+                let mut response = ws_server::fetch_from_running_bridge(&args.url, timeout).await?;
+                if let Some(selector) = args.selector.as_deref() {
+                    response.body = exfetch::extract::select_html(&response.body, selector)
+                        .map_err(anyhow::Error::msg)?;
+                }
+                let result = if args.raw {
+                    output::text::format_raw(&response.body, args.max_length)
+                } else if args.json {
+                    output::json::format(&response, args.max_length)
+                } else if args.markdown {
+                    output::markdown::format(&response.body, args.max_length)
+                } else {
+                    output::text::format(&response.body, args.max_length)
+                };
+                println!("{}", result);
+                return Ok(());
+            }
 
             // Detect PDF by URL extension (before fetching)
             let is_pdf_url = args.url.to_lowercase().ends_with(".pdf");
 
             if is_pdf_url {
                 // PDF path: fetch raw bytes and extract text
-                match fetch_bytes(&args.url, timeout, &args.user_agent).await {
+                match fetch_bytes_with_policy(&args.url, timeout, user_agent, &policy).await {
                     Ok(resp) => {
                         if args.verbose {
                             eprintln!(
@@ -65,8 +94,12 @@ async fn main() -> Result<()> {
                 }
             } else {
                 // Standard text/HTML path
-                match fetch_url(&args.url, timeout, &args.user_agent).await {
-                    Ok(resp) => {
+                match fetch_url_with_policy(&args.url, timeout, user_agent, &policy).await {
+                    Ok(mut resp) => {
+                        if let Some(selector) = args.selector.as_deref() {
+                            resp.body = exfetch::extract::select_html(&resp.body, selector)
+                                .map_err(anyhow::Error::msg)?;
+                        }
                         // If the server responded with application/pdf content-type
                         // even though the URL didn't end in .pdf, re-fetch as bytes
                         if resp.content_type.to_lowercase().contains("application/pdf") {
@@ -78,7 +111,9 @@ async fn main() -> Result<()> {
                                 eprintln!("[exfetch] content-type: {} (detected as PDF, re-fetching as bytes)", resp.content_type);
                             }
 
-                            match fetch_bytes(&args.url, timeout, &args.user_agent).await {
+                            match fetch_bytes_with_policy(&args.url, timeout, user_agent, &policy)
+                                .await
+                            {
                                 Ok(bytes_resp) => match pdf::extract_text(&bytes_resp.bytes) {
                                     Ok(text) => {
                                         let out = output::text::format_raw(&text, args.max_length);
@@ -135,72 +170,51 @@ async fn main() -> Result<()> {
             }
         }
         Commands::Search(args) => {
-            let timeout = Duration::from_secs(args.timeout);
+            let timeout = Duration::from_secs(args.timeout.unwrap_or(config.defaults.timeout));
             let num_results = args.results as usize;
-
-            if args.fetch {
-                // Search + fetch top results
-                let fetch_count = std::cmp::min(3, num_results);
-                match search::search_and_fetch(&args.query, num_results, fetch_count, timeout).await
-                {
-                    Ok(results) => {
-                        if results.is_empty() {
-                            if !args.quiet {
-                                eprintln!("[exfetch] no results found for \"{}\"", args.query);
-                            }
-                        } else if args.json {
-                            let json = serde_json::to_string_pretty(&results)
-                                .unwrap_or_else(|e| format!("{{\"error\": \"{}\"}}", e));
-                            println!("{}", json);
-                        } else {
-                            println!("{}", search::format_fetched_results_text(&results));
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("error: {}", e);
-                        std::process::exit(1);
-                    }
+            let engine = args
+                .engine
+                .as_deref()
+                .unwrap_or(&config.defaults.search_engine);
+            let results = match engine {
+                "searxng" => {
+                    let instance = args.searxng_url.as_deref().or(config.defaults.searxng_url.as_deref())
+                        .ok_or_else(|| anyhow::anyhow!("Set --searxng-url or defaults.searxng_url to your SearXNG instance"))?;
+                    search::engine::search_searxng(&args.query, num_results, timeout, instance)
+                        .await?
                 }
-            } else {
-                // Search only (no fetch) -- select engine based on --engine flag
-                let search_result = match args.engine.as_str() {
-                    "searxng" => {
-                        let instance_url =
-                            args.searxng_url.as_deref().unwrap_or("https://searx.be");
-                        search::engine::search_searxng(
-                            &args.query,
-                            num_results,
-                            timeout,
-                            instance_url,
-                        )
-                        .await
-                    }
-                    _ => {
-                        // Default: DuckDuckGo
-                        search::engine::search_ddg(&args.query, num_results, timeout).await
-                    }
-                };
-
-                match search_result {
-                    Ok(results) => {
-                        if results.is_empty() {
-                            if !args.quiet {
-                                eprintln!("[exfetch] no results found for \"{}\"", args.query);
-                            }
-                        } else if args.json {
-                            let json = serde_json::to_string_pretty(&results)
-                                .unwrap_or_else(|e| format!("{{\"error\": \"{}\"}}", e));
-                            println!("{}", json);
-                        } else {
-                            println!("{}", search::format_results_text(&results));
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("error: {}", e);
-                        std::process::exit(1);
-                    }
+                "duckduckgo" => {
+                    search::engine::search_ddg(&args.query, num_results, timeout).await?
                 }
+                _ => anyhow::bail!("Unknown search engine: {}", engine),
+            };
+            if results.is_empty() && !args.quiet {
+                eprintln!("[exfetch] no results found for {:?}", args.query);
             }
+            let output = if args.fetch {
+                let policy = PolicyEngine::from_config(&config.policy);
+                let results = search::fetch_search_results_with_policy(
+                    results,
+                    std::cmp::min(3, num_results),
+                    timeout,
+                    Some(&policy),
+                )
+                .await?;
+                if args.json {
+                    serde_json::to_string_pretty(&results)?
+                } else if args.markdown {
+                    search::format_fetched_results_markdown(&results)
+                } else {
+                    search::format_fetched_results_text(&results)
+                }
+            } else if args.json {
+                serde_json::to_string_pretty(&results)?
+            } else if args.markdown {
+                search::format_results_markdown(&results)
+            } else {
+                search::format_results_text(&results)
+            };
+            println!("{}", output);
         }
         Commands::Serve(args) => {
             // Daemon mode: fork to background before starting anything
@@ -237,14 +251,21 @@ async fn main() -> Result<()> {
             }
 
             let connections = ConnectionManager::new();
-            let policy = Arc::new(PolicyEngine::new());
+            let policy = Arc::new(PolicyEngine::from_config(&config.policy));
 
             if args.mcp_stdio {
                 // The extension bridge must run in-process: browser tools resolve
                 // against this process's ConnectionManager. Best-effort, so a busy
                 // port range never takes the MCP server down with it.
                 let token = ws_server::generate_token();
-                match ws_server::start(args.port, token, connections.clone()).await {
+                match ws_server::start_with_policy(
+                    args.port,
+                    token,
+                    connections.clone(),
+                    policy.clone(),
+                )
+                .await
+                {
                     Ok(actual_port) => eprintln!(
                         "[exfetch] WebSocket bridge listening on 127.0.0.1:{}",
                         actual_port
@@ -257,8 +278,13 @@ async fn main() -> Result<()> {
             } else {
                 // Start WebSocket server for browser extension bridge
                 let token = ws_server::generate_token();
-                let actual_port =
-                    ws_server::start(args.port, token.clone(), connections.clone()).await?;
+                let actual_port = ws_server::start_with_policy(
+                    args.port,
+                    token.clone(),
+                    connections.clone(),
+                    policy.clone(),
+                )
+                .await?;
 
                 eprintln!(
                     "[exfetch] WebSocket server listening on 127.0.0.1:{}",

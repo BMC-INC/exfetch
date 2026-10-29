@@ -3,21 +3,19 @@ use std::time::Duration;
 
 use anyhow::Result;
 use axum::extract::State;
-use axum::response::sse::{Event, Sse};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::Json;
 use axum::Router;
-use futures_util::stream::Stream;
-use futures_util::StreamExt;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::broadcast;
 use tracing;
 
 use crate::bridge::connection::ConnectionManager;
-use crate::engine::policy::PolicyEngine;
+use crate::engine::command::BrowserActionType;
+use crate::engine::policy::{PolicyEngine, PolicyVerdict};
 use crate::extract::readability;
-use crate::fetch::http::fetch_url;
+use crate::fetch::http::{fetch_url_with_policy, FetchResponse};
 use crate::output;
 use crate::search;
 
@@ -102,12 +100,7 @@ pub async fn run_sse(
         tx,
     };
 
-    let app = Router::new()
-        .route("/", get(sse_handler.clone()).post(mcp_handler.clone()))
-        .route("/sse", get(sse_handler))
-        .route("/mcp", post(mcp_handler.clone()))
-        .route("/message", post(message_handler).post(mcp_handler))
-        .with_state(state);
+    let app = sse_router(state);
 
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
     let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -115,6 +108,18 @@ pub async fn run_sse(
 
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+fn sse_router(state: SseState) -> Router {
+    Router::new()
+        .route("/", get(sse_handler).post(mcp_handler))
+        .route("/sse", get(sse_handler))
+        .route("/mcp", post(mcp_handler))
+        .route("/message", post(message_handler))
+        .with_state(state)
+        .layer(axum::middleware::from_fn(
+            crate::bridge::ws_server::require_loopback_host,
+        ))
 }
 
 /// SSE endpoint using a raw streaming body to ensure immediate flush
@@ -229,9 +234,10 @@ async fn mcp_handler(
             return axum::http::Response::builder()
                 .status(400)
                 .header("content-type", "application/json")
-                .body(axum::body::Body::from(
-                    format!(r#"{{"jsonrpc":"2.0","error":{{"code":-32700,"message":"Parse error: {}"}}}}"#, e),
-                ))
+                .body(axum::body::Body::from(format!(
+                    r#"{{"jsonrpc":"2.0","error":{{"code":-32700,"message":"Parse error: {}"}}}}"#,
+                    e
+                )))
                 .unwrap();
         }
     };
@@ -249,10 +255,12 @@ async fn mcp_handler(
     // Return as SSE stream (single event, then close) — this is what Streamable HTTP expects
     let resp_json = match response {
         Some(resp) => serde_json::to_string(&resp).unwrap_or_default(),
-        None => return axum::http::Response::builder()
-            .status(202)
-            .body(axum::body::Body::empty())
-            .unwrap(),
+        None => {
+            return axum::http::Response::builder()
+                .status(202)
+                .body(axum::body::Body::empty())
+                .unwrap()
+        }
     };
 
     let sse_body = format!("event: message\ndata: {}\n\n", resp_json);
@@ -274,7 +282,7 @@ async fn mcp_handler(
 async fn handle_request(
     req: &JsonRpcRequest,
     connections: &ConnectionManager,
-    _policy: &PolicyEngine,
+    policy: &PolicyEngine,
 ) -> Option<JsonRpcResponse> {
     let id = match &req.id {
         Some(id) => id.clone(),
@@ -293,7 +301,7 @@ async fn handle_request(
             JsonRpcResponse::success(id, serde_json::json!({}))
         }
         "tools/list" => handle_tools_list(id),
-        "tools/call" => handle_tools_call(id, &req.params, connections).await,
+        "tools/call" => handle_tools_call(id, &req.params, connections, policy).await,
         _ => JsonRpcResponse::error(id, -32601, format!("Method not found: {}", req.method)),
     };
 
@@ -334,6 +342,7 @@ async fn handle_tools_call(
     id: serde_json::Value,
     params: &serde_json::Value,
     connections: &ConnectionManager,
+    policy: &PolicyEngine,
 ) -> JsonRpcResponse {
     let tool_name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
 
@@ -342,10 +351,21 @@ async fn handle_tools_call(
         .cloned()
         .unwrap_or(serde_json::json!({}));
 
+    if tool_name != "connection_status" {
+        if let PolicyVerdict::Block(reason) = policy.check_rate_limit() {
+            return JsonRpcResponse::error(id, -32000, reason);
+        }
+        policy.record_request();
+        if let Some(url) = arguments.get("url").and_then(|value| value.as_str()) {
+            if let PolicyVerdict::Block(reason) = policy.check_domain(url) {
+                return JsonRpcResponse::error(id, -32000, reason);
+            }
+        }
+    }
     match tool_name {
-        "fetch_page" => handle_fetch_page(id, &arguments).await,
-        "search_web" => handle_search_web(id, &arguments).await,
-        "browser_action" => handle_browser_action(id, &arguments, connections).await,
+        "fetch_page" => handle_fetch_page(id, &arguments, connections, policy).await,
+        "search_web" => handle_search_web(id, &arguments, policy).await,
+        "browser_action" => handle_browser_action(id, &arguments, connections, policy).await,
         "connection_status" => handle_connection_status(id, connections).await,
         _ => JsonRpcResponse::error(id, -32602, format!("Unknown tool: {}", tool_name)),
     }
@@ -355,7 +375,12 @@ async fn handle_tools_call(
 // Tool handlers
 // ---------------------------------------------------------------------------
 
-async fn handle_fetch_page(id: serde_json::Value, args: &serde_json::Value) -> JsonRpcResponse {
+async fn handle_fetch_page(
+    id: serde_json::Value,
+    args: &serde_json::Value,
+    connections: &ConnectionManager,
+    policy: &PolicyEngine,
+) -> JsonRpcResponse {
     let url = match args.get("url").and_then(|v| v.as_str()) {
         Some(u) => u,
         None => return JsonRpcResponse::error(id, -32602, "Missing required parameter: url"),
@@ -373,10 +398,72 @@ async fn handle_fetch_page(id: serde_json::Value, args: &serde_json::Value) -> J
             .unwrap_or(500_000),
     );
 
-    let timeout = Duration::from_secs(15);
+    let config = match crate::config::load() {
+        Ok(config) => config,
+        Err(error) => return JsonRpcResponse::error(id, -32000, error.to_string()),
+    };
+    let timeout = Duration::from_secs(config.defaults.timeout);
 
-    match fetch_url(url, timeout, "exfetch/0.1").await {
-        Ok(resp) => {
+    let use_browser = args
+        .get("use_browser")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+    let response = if use_browser {
+        if !connections.has_connections().await {
+            return JsonRpcResponse::error(
+                id,
+                -32000,
+                "Browser fetching requires a connected extension in this MCP process",
+            );
+        }
+        match connections
+            .send_command("fetch_page", serde_json::json!({"url": url, "blocked_domains": policy.blocked_domains, "allowed_domains": policy.allowed_domains, "reuse_strategy": config.tabs.reuse_strategy, "open_in_background": config.tabs.open_in_background}))
+            .await
+        {
+            Ok(result) => {
+                if result.get("success").and_then(|value| value.as_bool()) == Some(false) {
+                    return JsonRpcResponse::error(
+                        id,
+                        -32000,
+                        result
+                            .get("error")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or("Browser fetch failed"),
+                    );
+                }
+                let Some(html) = result.get("html").and_then(|value| value.as_str()) else {
+                    return JsonRpcResponse::error(id, -32000, "Browser returned no HTML");
+                };
+                Ok(FetchResponse {
+                    body: html.to_string(),
+                    status: 200,
+                    content_type: "text/html".into(),
+                    final_url: result
+                        .get("url")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or(url)
+                        .to_string(),
+                    headers: Vec::new(),
+                    fetch_time_ms: 0,
+                })
+            }
+            Err(error) => return JsonRpcResponse::error(id, -32000, error.to_string()),
+        }
+    } else {
+        fetch_url_with_policy(url, timeout, &config.defaults.user_agent, policy).await
+    };
+
+    match response {
+        Ok(mut resp) => {
+            if let PolicyVerdict::Block(reason) = policy.check_domain(&resp.final_url) {
+                return JsonRpcResponse::error(id, -32000, reason);
+            }
+            if let Some(selector) = args.get("selector").and_then(|value| value.as_str()) {
+                match crate::extract::select_html(&resp.body, selector) {
+                    Ok(html) => resp.body = html,
+                    Err(error) => return JsonRpcResponse::error(id, -32602, error),
+                }
+            }
             let content = match format {
                 "html" | "raw" => output::text::format_raw(&resp.body, max_length),
                 "text" => {
@@ -402,7 +489,11 @@ async fn handle_fetch_page(id: serde_json::Value, args: &serde_json::Value) -> J
     }
 }
 
-async fn handle_search_web(id: serde_json::Value, args: &serde_json::Value) -> JsonRpcResponse {
+async fn handle_search_web(
+    id: serde_json::Value,
+    args: &serde_json::Value,
+    policy: &PolicyEngine,
+) -> JsonRpcResponse {
     let query = match args.get("query").and_then(|v| v.as_str()) {
         Some(q) => q,
         None => return JsonRpcResponse::error(id, -32602, "Missing required parameter: query"),
@@ -423,47 +514,72 @@ async fn handle_search_web(id: serde_json::Value, args: &serde_json::Value) -> J
         .and_then(|v| v.as_u64())
         .unwrap_or(3) as usize;
 
-    let timeout = Duration::from_secs(15);
-
-    if fetch_results {
-        match search::search_and_fetch(query, num_results, fetch_count, timeout).await {
-            Ok(results) => {
-                let text = search::format_fetched_results_text(&results);
-                JsonRpcResponse::success(
+    let config = match crate::config::load() {
+        Ok(config) => config,
+        Err(error) => return JsonRpcResponse::error(id, -32000, error.to_string()),
+    };
+    let timeout = Duration::from_secs(config.defaults.timeout);
+    let results = match config.defaults.search_engine.as_str() {
+        "duckduckgo" => search::engine::search_ddg(query, num_results, timeout).await,
+        "searxng" => match config.defaults.searxng_url.as_deref() {
+            Some(instance) => {
+                search::engine::search_searxng(query, num_results, timeout, instance).await
+            }
+            None => {
+                return JsonRpcResponse::error(
                     id,
-                    serde_json::json!({
-                        "content": [{
-                            "type": "text",
-                            "text": text
-                        }]
-                    }),
+                    -32602,
+                    "Configure defaults.searxng_url before choosing SearXNG",
                 )
             }
-            Err(e) => JsonRpcResponse::error(id, -32000, format!("Search failed: {}", e)),
+        },
+        _ => return JsonRpcResponse::error(id, -32602, "Unknown configured search engine"),
+    };
+    let results = match results {
+        Ok(results) => results,
+        Err(error) => {
+            return JsonRpcResponse::error(id, -32000, format!("Search failed: {}", error))
+        }
+    };
+    let format = args
+        .get("format")
+        .and_then(|value| value.as_str())
+        .unwrap_or("markdown");
+    let text = if fetch_results {
+        match search::fetch_search_results_with_policy(results, fetch_count, timeout, Some(policy))
+            .await
+        {
+            Ok(results) => match format {
+                "json" => serde_json::to_string_pretty(&results).unwrap_or_default(),
+                "markdown" => search::format_fetched_results_markdown(&results),
+                "html" => search::format_fetched_results_html(&results),
+                "text" => search::format_fetched_results_text(&results),
+                _ => return JsonRpcResponse::error(id, -32602, "Unsupported output format"),
+            },
+            Err(error) => {
+                return JsonRpcResponse::error(id, -32000, format!("Fetch failed: {}", error))
+            }
         }
     } else {
-        match search::engine::search_ddg(query, num_results, timeout).await {
-            Ok(results) => {
-                let text = search::format_results_text(&results);
-                JsonRpcResponse::success(
-                    id,
-                    serde_json::json!({
-                        "content": [{
-                            "type": "text",
-                            "text": text
-                        }]
-                    }),
-                )
-            }
-            Err(e) => JsonRpcResponse::error(id, -32000, format!("Search failed: {}", e)),
+        match format {
+            "json" => serde_json::to_string_pretty(&results).unwrap_or_default(),
+            "markdown" => search::format_results_markdown(&results),
+            "html" => search::format_results_html(&results),
+            "text" => search::format_results_text(&results),
+            _ => return JsonRpcResponse::error(id, -32602, "Unsupported output format"),
         }
-    }
+    };
+    JsonRpcResponse::success(
+        id,
+        serde_json::json!({"content": [{"type": "text", "text": text}]}),
+    )
 }
 
 async fn handle_browser_action(
     id: serde_json::Value,
     args: &serde_json::Value,
     connections: &ConnectionManager,
+    policy: &PolicyEngine,
 ) -> JsonRpcResponse {
     if !connections.has_connections().await {
         return JsonRpcResponse::error(
@@ -481,6 +597,37 @@ async fn handle_browser_action(
         }
     };
 
+    if args.get("full_page").and_then(|value| value.as_bool()) == Some(true) {
+        return JsonRpcResponse::error(
+            id,
+            -32602,
+            "Full-page screenshots are unavailable; the extension captures the visible viewport",
+        );
+    }
+    let action_type: BrowserActionType = match serde_json::from_value(serde_json::json!(action)) {
+        Ok(action) => action,
+        Err(_) => return JsonRpcResponse::error(id, -32602, "Unknown browser action"),
+    };
+    if let PolicyVerdict::Block(reason) = policy.check_action(&action_type) {
+        return JsonRpcResponse::error(id, -32000, reason);
+    }
+
+    if action_type == BrowserActionType::GetCookies {
+        let Some(url) = args.get("url").and_then(|value| value.as_str()) else {
+            return JsonRpcResponse::error(id, -32602, "Cookie reading requires an explicit URL");
+        };
+        if let PolicyVerdict::Block(reason) = policy.check_cookie_url(url) {
+            return JsonRpcResponse::error(id, -32000, reason);
+        }
+    } else if policy.has_domain_restrictions()
+        && (matches!(
+            action_type,
+            BrowserActionType::SwitchTab | BrowserActionType::ListTabs
+        ) || args.get("url").and_then(|value| value.as_str()).is_none())
+    {
+        return JsonRpcResponse::error(id, -32602, "Domain-restricted browser actions require an explicit URL; active-tab and tab-id actions are unavailable under this policy");
+    }
+
     // Build bridge command params from the MCP arguments.
     // The bridge command name matches the action name.
     // Pass through all relevant parameters.
@@ -492,6 +639,8 @@ async fn handle_browser_action(
         "code": args.get("code"),
         "full_page": args.get("full_page"),
         "domain": args.get("domain"),
+        "blocked_domains": policy.blocked_domains,
+        "allowed_domains": policy.allowed_domains,
     });
 
     match connections.send_command(action, bridge_params).await {
@@ -536,4 +685,180 @@ async fn handle_connection_status(
             }]
         }),
     )
+}
+
+#[cfg(test)]
+mod policy_tests {
+    use super::*;
+    use crate::bridge::connection::ExtensionConnection;
+    use tokio::sync::mpsc;
+
+    #[tokio::test]
+    async fn http_transport_initializes_and_rejects_unexpected_hosts() {
+        use tower::ServiceExt;
+        let (tx, _) = broadcast::channel(8);
+        let app = sse_router(SseState {
+            connections: ConnectionManager::new(),
+            policy: Arc::new(PolicyEngine::new()),
+            tx,
+        });
+        let request = |host| {
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/mcp")
+                .header("host", host)
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+                ))
+                .unwrap()
+        };
+        let response = app
+            .clone()
+            .oneshot(request("127.0.0.1:9876"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        let body = axum::body::to_bytes(response.into_body(), 10000)
+            .await
+            .unwrap();
+        assert!(std::str::from_utf8(&body)
+            .unwrap()
+            .contains("protocolVersion"));
+        assert_eq!(
+            app.oneshot(request("attacker.example"))
+                .await
+                .unwrap()
+                .status(),
+            403
+        );
+    }
+
+    #[tokio::test]
+    async fn policy_blocks_execute_js_before_the_extension_receives_it() {
+        let connections = ConnectionManager::new();
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        connections
+            .add(ExtensionConnection {
+                id: "test".into(),
+                browser: "test".into(),
+                profile: "test".into(),
+                sender,
+                connected_at: String::new(),
+            })
+            .await;
+        let response = handle_tools_call(serde_json::json!(1), &serde_json::json!({
+            "name": "browser_action", "arguments": {"action": "execute_js", "code": "document.cookie"}
+        }), &connections, &PolicyEngine::new()).await;
+        assert!(response.error.unwrap().message.contains("not allowed"));
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn restricted_actions_cannot_bypass_policy_with_active_tabs_or_fake_urls() {
+        let connections = ConnectionManager::new();
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        connections
+            .add(ExtensionConnection {
+                id: "test".into(),
+                browser: "test".into(),
+                profile: "test".into(),
+                sender,
+                connected_at: String::new(),
+            })
+            .await;
+        let mut policy = PolicyEngine::new();
+        policy.blocked_domains.push("blocked.example".into());
+        for args in [
+            serde_json::json!({"action": "read_dom"}),
+            serde_json::json!({"action": "switch_tab", "tab_id": 123, "url": "https://allowed.example"}),
+        ] {
+            let response =
+                handle_browser_action(serde_json::json!(1), &args, &connections, &policy).await;
+            assert!(response
+                .error
+                .unwrap()
+                .message
+                .contains("Domain-restricted"));
+        }
+        policy.allow_cookie_read = true;
+        let response = handle_browser_action(
+            serde_json::json!(1),
+            &serde_json::json!({"action": "get_cookies"}),
+            &connections,
+            &policy,
+        )
+        .await;
+        assert!(response.error.unwrap().message.contains("explicit URL"));
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn explicit_browser_fetch_does_not_silently_use_http() {
+        let response = handle_fetch_page(
+            serde_json::json!(1),
+            &serde_json::json!({
+                "url": "https://example.com", "use_browser": true
+            }),
+            &ConnectionManager::new(),
+            &PolicyEngine::new(),
+        )
+        .await;
+        assert!(response
+            .error
+            .unwrap()
+            .message
+            .contains("requires a connected extension"));
+    }
+
+    #[tokio::test]
+    async fn blocked_domain_is_rejected_before_fetching() {
+        let mut policy = PolicyEngine::new();
+        policy.blocked_domains.push("example.com".into());
+        let response = handle_tools_call(
+            serde_json::json!(1),
+            &serde_json::json!({
+                "name": "fetch_page", "arguments": {"url": "https://example.com"}
+            }),
+            &ConnectionManager::new(),
+            &policy,
+        )
+        .await;
+        assert!(response
+            .error
+            .unwrap()
+            .message
+            .contains("blocked by policy"));
+    }
+
+    #[tokio::test]
+    async fn browser_fetch_extracts_requested_elements() {
+        let connections = ConnectionManager::new();
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        connections
+            .add(ExtensionConnection {
+                id: "test".into(),
+                browser: "test".into(),
+                profile: "test".into(),
+                sender,
+                connected_at: String::new(),
+            })
+            .await;
+        let pending = connections.pending().clone();
+        tokio::spawn(async move {
+            let message: serde_json::Value =
+                serde_json::from_str(&receiver.recv().await.unwrap()).unwrap();
+            assert_eq!(message["command"], "fetch_page");
+            pending.complete(message["id"].as_str().unwrap(), serde_json::json!({
+                "success": true, "html": "<h1>Heading</h1><p>Body</p>", "url": "https://example.com"
+            })).await;
+        });
+        let response = handle_fetch_page(serde_json::json!(1), &serde_json::json!({
+            "url": "https://example.com", "use_browser": true, "selector": "h1", "format": "html"
+        }), &connections, &PolicyEngine::new()).await;
+        assert_eq!(
+            response.result.unwrap()["content"][0]["text"],
+            "<h1>Heading</h1>"
+        );
+    }
 }
